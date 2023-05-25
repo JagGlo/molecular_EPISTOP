@@ -1,0 +1,2262 @@
+---
+title: "Publication plots"
+output: 
+  html_notebook:
+    toc: TRUE
+---
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggsci)
+library(ggpubr)
+library(xlsx)
+```
+
+
+# Read data
+
+```{r}
+data <- readRDS(here::here("univariate_analysis/data/raw_data.RDS"))
+```
+
+# Fig 1 + VGB effect
+
+```{r}
+library(factoextra)
+
+convert2matrix<-function(x) {
+    m<-as.matrix(x[,-1])
+    rownames(m)<-x[[1]]
+    m
+}
+
+plot_PCA <- function(data_to_plot, title){
+  
+  data_matrix <- convert2matrix(data_to_plot)
+  data_matrix <- data_matrix[ , colSums(is.na(data_matrix)) == 0]
+  data_matrix <- data_matrix[,!is.infinite(colSums(data_matrix))]
+  
+  res.pca <- prcomp(data_matrix, scale = F) 
+  
+  groups <- 
+    data.frame(sample_anon = rownames(data_matrix)) %>% 
+      left_join(
+         data$annotations %>%
+      select(sample_anon, Condition, 'VGB'),
+      by = "sample_anon") %>% 
+      distinct()
+  
+  plot <- 
+    fviz_pca_ind(res.pca,
+               col.ind = as.factor(groups$VGB) %>% fct_relevel("non-TSC controls", "no VGB treatment", "VGB treatment"),
+               legend.title = "VGB groups",
+               palette= pal_nejm("default")(5)[2:3],
+               geom = "point"
+               ) +
+    labs(title = title) +
+    theme_classic() +
+    theme(legend.position = "top",  text=element_text(size=12,  family="Helvetica"), plot.title = element_text(size=12), axis.text = element_text(size=12, colour = "black"))
+  
+    data <- 
+    res.pca[["x"]][, 1:2] %>% as.data.frame() %>% rownames_to_column("sample_anon") %>% left_join(groups)
+  
+  return(list(data = data, plot = plot))
+    
+}
+```
+
+```{r}
+fig_data <- list()
+
+p1 <- 
+  plot_PCA(data$metabolite_batch_corr, "Batch corrected data")
+
+fig_data$Fig_1a <- p1$data
+```
+
+```{r}
+p2 <- plot_PCA(data$met_batch_VGB_corr, "Batch and VGB corrected data")
+
+fig_data$Fig_1b <- p2$data
+```
+
+## VGB effect
+
+```{r}
+compare_means <- function(df, hypothesis = "two.sided", allow_parametric = TRUE) {
+  split_factor <-
+    df[[1]]
+  assertthat::assert_that(is.factor(split_factor))
+  assertthat::assert_that(length(levels(split_factor)) == 2)
+  assertthat::noNA(split_factor)
+  numerics <-
+    df %>%
+    select(-1)
+  colnames <- names(numerics)
+  normal_cols <- # first assumption of t-tests
+    numerics %>%
+    sapply(function(i) {
+      testA <- tryCatch({
+        shapiro.test(i[split_factor == levels(split_factor)[1]])
+      }, warning = function(w) {
+        warning(w)
+        return(list(p.value = 1))
+      }, error = function(e) {
+        warning(e)
+        return(list(p.value = 1))
+      })
+      
+      testB <- tryCatch({
+        shapiro.test(i[split_factor == levels(split_factor)[2]])
+      }, warning = function(w) {
+        warning(w)
+        return(list(p.value = 1))
+      }, error = function(e) {
+        warning(e)
+        return(list(p.value = 1))
+      })
+      
+      testA$p.value >= 0.05 & testB$p.value >= 0.05
+    })
+  equal_vars <- # second assuption of t-tests
+    numerics %>%
+    sapply(function(i) {
+      test <- var.test(
+        i[split_factor == levels(split_factor)[1]],
+        i[split_factor == levels(split_factor)[2]]
+      )
+      test$p.value >= 0.05
+    })
+  t_eligible <- normal_cols & equal_vars
+  KW_tests <-
+    numerics %>%
+    lapply(function(i) wilcox.test(
+      x = i[split_factor == levels(split_factor)[1]],
+      y = i[split_factor == levels(split_factor)[2]],
+      alternative = hypothesis
+    ))
+  t_tests <-
+    numerics %>%
+    lapply(function(i) t.test(
+      x = i[split_factor == levels(split_factor)[1]],
+      y = i[split_factor == levels(split_factor)[2]],
+      alternative = hypothesis
+    ))
+  lapply(seq_along(t_eligible), function(x) {
+    if (t_eligible[x] == TRUE & allow_parametric & as.numeric(table(split_factor)[1]) >= 30 & as.numeric(table(split_factor)[2]) >= 30) return(t_tests[[x]] %>% broom::tidy()) else return(KW_tests[[x]] %>% broom::tidy())
+  }) %>%
+    bind_rows() %>%
+    select(statistic, p.value, method, alternative) %>%
+    mutate(alternative = case_when(
+      alternative == "less" ~ paste(levels(split_factor)[1], "<", levels(split_factor)[2]),
+      alternative == "greater" ~ paste(levels(split_factor)[1], ">", levels(split_factor)[2]),
+      alternative == "two.sided" ~ paste(levels(split_factor)[1], "!=", levels(split_factor)[2])
+    )) %>%
+    add_column(feature = colnames, .before = 1) %>%
+    left_join(
+      df %>%
+        gather("feature", "val", -!!sym(names(df)[1])) %>%
+        group_by(feature, !!sym(names(df)[1])) %>%
+        summarise(valid = sum(!is.na(val))) %>%
+        group_by(feature) %>%
+        summarise(valid = paste(valid, collapse = " + ")),
+      by = "feature"
+    ) %>%
+    mutate(p.value.fdr = p.adjust(p.value, method = "BH")) %>%
+    select(feature, valid, statistic, p.value, p.value.fdr, method, alternative)
+}
+
+```
+
+```{r}
+VGB_effect_results <-
+data$metabolite_batch_corr %>% 
+  left_join(
+    data$annotations %>%
+      filter(Dev_Age_Grouping_new == "> 40 weeks") %>% 
+      group_by(code_anon) %>%
+      slice_max(sample_age_w) %>%
+      ungroup() %>%
+      select(sample_anon, Condition, 'VGB'), 
+    by = "sample_anon"
+    ) %>%
+  # filter(Condition != "Control" ) %>% 
+  distinct() %>%
+  select(-Condition) %>% 
+  gather(key, value, -sample_anon, -VGB) %>% 
+  filter(!is.na(VGB)) %>% 
+  split(., .$key) %>%
+  lapply(function(x){
+    name <- x$key[1]
+    results <-
+    x %>% 
+      transmute(VGB = as.factor(VGB), value) %>% 
+      compare_means(allow_parametric = F) %>% 
+      mutate(feature = name, 
+             p.value.fdr  = p.value.fdr  %>% round(6))
+    
+     medians <-
+                x %>% 
+                filter(!is.na(value)) %>% 
+                group_by(VGB) %>% 
+                summarise(median = median(value, na.rm = T)) %>% 
+       spread(VGB, median)
+     
+      results <-
+              bind_cols(
+                results,
+                medians)
+      
+      return(results)
+  }) %>% 
+  bind_rows() %>% 
+  mutate(p.value.fdr = p.adjust(p.value, method = "BH")) 
+
+# 63 signif. hits with Controls
+# 53 without Controls
+# one sample per patient - 68/58 signif.
+#for all samples: 140 signif. hits with Controls, 154 without Controls
+
+VGB_effect_results %>%  
+  arrange(p.value.fdr) %>% 
+  filter(p.value.fdr < 0.05) %>% 
+  mutate(p.value.fdr  = p.value.fdr  %>% round(4)) %>%
+xlsx::write.xlsx(here::here("univariate_analysis/tables/Table_S2_Metabolites associated with VGB treatment_recalculated.xlsx"))
+
+vector_of_signif <- 
+  VGB_effect_results %>% 
+  arrange(p.value.fdr) %>% 
+  filter(p.value.fdr < 0.05) %>% 
+  head(7) %>% 
+  pull(feature)
+
+plot_data <-
+bind_rows(
+  "batch" = data$metabolite_batch_corr %>% select(sample_anon, vector_of_signif),
+  "batch and VGB" = data$met_batch_VGB_corr %>% select(sample_anon, vector_of_signif),
+  .id = "id"
+) %>% 
+  gather(variable, `log2 intensity`, -sample_anon, -id) %>% 
+  # left_join(
+  #   data$annotations %>%
+  #   select(sample_anon, 'VGB'), by = "sample_anon"
+  # )  %>%
+   left_join(
+    data$annotations %>%
+      filter(Dev_Age_Grouping_new == "> 40 weeks") %>% 
+      group_by(code_anon) %>%
+      slice_max(sample_age_w) %>%
+      ungroup() %>%
+      select(sample_anon, Condition, 'VGB'), 
+    by = "sample_anon"
+    ) %>%
+  # filter(Condition != "Control" ) %>% 
+  distinct() %>% 
+  filter(!is.na(VGB), !is.na( `log2 intensity`)) %>% 
+  mutate(VGB = as.factor(VGB) %>% fct_relevel("no VGB treatment", "VGB treatment"))
+```
+
+
+```{r}
+raincloud_plot <- function(x, title){
+  
+   ggplot(aes(x = VGB, y = `log2 intensity`, fill = VGB), data = x)+
+        ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(aes(color = VGB), position = position_jitter(width = .15), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+     scale_color_manual(values = pal_nejm("default")(5)[2:3]) +
+    scale_fill_manual(values = pal_nejm("default")(5)[2:3]) +
+      facet_grid(~id, scales = "free") +
+      labs(x = NULL, title = title) +
+      theme_classic() +
+      theme(legend.position = "none",
+                axis.text.x= element_blank(),#element_text(angle=60, hjust=1), 
+                text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black"), strip.text.x = element_text(size = 10), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+}
+
+```
+
+```{r}
+p3 <- 
+  plot_data %>% 
+  filter(variable == "Kynurenic acid") %>% # "4-aminobutyrate"))
+  raincloud_plot(title = "Kynurenic acid")
+
+p4 <- plot_data %>% 
+  filter(variable == "4-aminobutyrate") %>% 
+  raincloud_plot(title = "4-aminobutyrate")
+
+p5 <- plot_data %>% 
+  filter(variable == "glutathione") %>% 
+  raincloud_plot(title = "glutathione")
+
+p6 <- plot_data %>% 
+  filter(variable == "glutathione-nega") %>% 
+  raincloud_plot(title = "glutathione-nega")
+
+p7 <- plot_data %>% 
+  filter(variable == "dCMP") %>% 
+  raincloud_plot(title = "dCMP")
+p8 <- plot_data %>% 
+  filter(variable == "Aminoadipic acid") %>% 
+  raincloud_plot(title = "Aminoadipic acid")
+
+fig_data$`Fig_1c-h` <-
+plot_data %>% 
+  spread(variable, `log2 intensity`) 
+```
+
+## Final figure
+
+```{r}
+figure1 <- ggpubr::ggarrange(
+   ggarrange(p1$plot, p2$plot, labels = c("a", "b"), common.legend = TRUE, legend = "bottom"),
+  ggarrange(p3, p4, p5, p6, p7, p8, labels = c("c", "d", "e", "f", "g", "h")),
+  nrow = 2
+) 
+
+figure1
+
+ggsave(here::here("univariate_analysis/figures/figure_1.pdf"), plot=figure1, width=210, height=276, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_1.png"), plot=figure1, width=210, height=276, units='mm', dpi=1200)
+
+rm(list = c("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "plot_data", "VGB_effect_results", "vector_of_signif"))
+```
+
+# Fig 2
+
+## Prepare data
+
+```{r}
+proteins <-
+  data$proteomics_before_corr %>% 
+  gather('molecule', 'value', -sample_anon) %>%
+  filter(!str_detect(molecule, "^\\(")) %>%
+  filter(!is.na(value)) %>% 
+  left_join(
+    data$annotations %>%  
+      select(sample_anon, sample_age_w) %>% 
+      distinct()
+  ) %>% 
+  mutate(value = value %>% as.numeric(), sample_age_w = sample_age_w %>% as.numeric())
+  
+selected_RNAs <- read_csv(here::here("univariate_analysis/data/names_of_selected_RNAs.csv"))
+
+RNASeq <-
+  data$rna_log2_CPM_TMM_before_corr %>% 
+  select(sample_anon, selected_RNAs$names) %>% 
+  gather('molecule', 'value', -sample_anon) %>%
+  left_join(
+    data$annotations %>%  
+      select(sample_anon, sample_age_w) %>% 
+      distinct()
+  ) %>% 
+  mutate(value = value %>% as.numeric(), sample_age_w = sample_age_w %>% as.numeric())
+  
+metabolites <-
+  data$metabolite_batch_corr %>% 
+  gather('molecule', 'value', -sample_anon) %>%
+  filter(!is.na(value)) %>% 
+  left_join(
+    data$annotations %>%  
+      select(sample_anon, sample_age_w) %>% 
+      distinct()
+  ) %>% 
+  mutate(value = value %>% as.numeric(), sample_age_w = sample_age_w %>% as.numeric())
+```
+## Correlation with age
+
+```{r}
+calculate_corr_rank <- function(df){
+  
+  results <-
+  df %>%
+  split(., .$molecule) %>%
+  lapply(function(x) {
+    if(nrow(x) > 2){
+    molecule_id <- x$molecule[1]
+
+    result <-
+      cor.test(x$sample_age_w, x$value, method = "spearman") %>%
+      broom::tidy() %>%
+      add_column(molecule_id = molecule_id)
+
+    return(result)
+    }
+  }) %>%
+  bind_rows() %>%
+  mutate(p.value.fdr = p.adjust(p.value, method = "BH"),
+         p.value.fdr = case_when(
+            p.value.fdr < 0.05 ~ "p-value FDR  < 0.05", 
+            p.value.fdr < 0.1 ~ "p-value FDR  < 0.1",
+            TRUE ~ "not significant")
+  )
+  
+ return(results)
+  
+}
+```
+
+```{r}
+proteins_calculated <- calculate_corr_rank(proteins) 
+metabolomics_calculated <- calculate_corr_rank(metabolites)
+RNA_calculated <- calculate_corr_rank(RNASeq)
+
+plot_data <-
+  bind_rows(
+    proteins_calculated %>% add_column(dataset = "Proteomic") %>% filter(estimate < 1),
+    metabolomics_calculated %>% add_column(dataset = "Metabolite"),
+    RNA_calculated %>% add_column(dataset = "Transcriptomic")
+  )
+
+fig_data$Fig_2_d <- plot_data
+```
+
+```{r}
+p4 <- 
+  plot_data %>% 
+  mutate(p.value.fdr = p.value.fdr %>%  as.factor() %>% fct_relevel("p-value FDR  < 0.05", "p-value FDR  < 0.1"),
+         dataset = dataset %>% as.factor() %>% fct_relevel("Proteomic", "Metabolite")) %>%
+  arrange(dataset) %>% 
+  # write_csv("fig2_d.csv", na = as.character(NA))
+  ggplot() +
+  geom_boxplot(aes(x = dataset ,y = estimate)) +
+  geom_jitter(aes(x = dataset, y = estimate, color = p.value.fdr), max_size = 100) +
+  scale_color_nejm() +
+  scale_fill_nejm() +
+  # scale_colour_continuous(low = "yellow", high = "blue", name = "count", trans = "log",
+  # scale_color_continuous(low = "blue", high = "green") +
+  scale_y_continuous(breaks = c(-1, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  labs(x = NULL, y = "Spearman's rank correlation coef.", colour="P-value FDR:") +
+  facet_grid(~dataset, scales = "free_x") +
+  theme_classic() +
+  theme( legend.position = "bottom", legend.title = element_blank(), legend.direction = "vertical", strip.background = element_rect(color="white"),
+         text=element_text(size=12,  family="Helvetica", colour = "black"), strip.text = element_blank(), axis.text = element_text(size=12, colour = "black")) #element_text(size = 3.5))
+   
+
+p4
+```
+## PCA
+
+
+```{r}
+library(factoextra)
+
+convert2matrix<-function(x) {
+    m<-as.matrix(x[,-1])
+    rownames(m)<-x[[1]]
+    m
+}
+
+plot_PCA <- function(data_to_plot, title, no_1 = 1, no2 = 2){
+  
+  data_matrix <- convert2matrix(data_to_plot)
+  data_matrix <- data_matrix[ , colSums(is.na(data_matrix)) == 0]
+  data_matrix <- data_matrix[,!is.infinite(colSums(data_matrix))]
+  
+  res.pca <- prcomp(data_matrix, scale = F) 
+ 
+  groups <- 
+    data.frame(sample_anon = rownames(data_matrix)) %>% 
+      left_join(data$annotations %>%
+      select(sample_anon, 'Dev_Age_Grouping_new'), by = "sample_anon") %>% 
+      distinct()
+ 
+  plot <- 
+  fviz_pca_ind(res.pca,
+               col.ind = as.factor(groups$Dev_Age_Grouping_new) %>% fct_relevel("0-10 weeks", "11-40 weeks", "> 40 weeks"),
+               axes = c(no_1, no2),
+               legend.title = "Age groups",
+               palette= "nejm",
+               geom = "point"
+               ) +
+    labs(title = title) +
+    theme_classic() +
+    theme(legend.position = "bottom",  text=element_text(size=12,  family="Helvetica", colour = "black"), plot.title = element_text(size=12, colour = "black"), axis.text = element_text(size=12, colour = "black"))
+  
+  data <- 
+    res.pca[["x"]][, c(no_1, no2)] %>% as.data.frame() %>% rownames_to_column("sample_anon") %>% left_join(groups)
+  
+  return(list(data = data, plot = plot))
+}
+```
+
+```{r}
+p1 <- plot_PCA(data$proteomics_before_corr, "Proteomic data")
+
+fig_data$Fig_2_a <-  p1$data
+
+p1$plot
+```
+
+```{r}
+selected_RNAs <- read_csv(here::here("univariate_analysis/data/names_of_selected_RNAs.csv"))
+
+p1_S3 <- data$rna_log2_CPM_TMM_before_corr %>% select(sample_anon, selected_RNAs$names) %>% plot_PCA("")
+ggsave(here::here("univariate_analysis/figures/helpers/pcap1p2_rna.png"),plot = p1_S3$plot, height=120, width=120, units = "mm", dpi  = 1200)
+```
+
+
+```{r}
+p3 <- 
+  data$rna_log2_CPM_TMM_before_corr %>% 
+  select(sample_anon, selected_RNAs$names) %>% 
+  plot_PCA("Transcriptomic data; PC3 vs PC4",3, 4)
+
+fig_data$Fig_2_c <- p3$data 
+
+p3$plot
+```
+
+```{r}
+p2 <- plot_PCA(data$metabolite_batch_corr, "Metabolite data (batch corrected)")
+
+fig_data$Fig_2_b <- p2$data
+
+p2$plot
+```
+## Age effect
+
+```{r}
+p5 <-
+data$proteomics_before_corr %>% 
+  transmute(sample_anon, `log2 intensity` = `Tenascin`) %>% 
+  filter(!is.na(`log2 intensity`)) %>% 
+  left_join(
+    data$annotations %>%  
+      transmute(sample_anon, sample_age_w = as.numeric(sample_age_w)) %>% 
+      distinct()
+  ) 
+
+fig_data$Fig_2_e <- p5
+
+p5 <- 
+  p5 %>% 
+  ggplot(aes(x = sample_age_w, y = `log2 intensity`)) + 
+          geom_point() +
+          theme_classic() +
+          theme(legend.position = "bottom", legend.direction = "vertical",  text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black")) +
+          geom_smooth(method = lm) +
+          ggpubr::stat_cor(method = "spearman", label.x = 25, label.y.npc = "top", size = 12 /.pt) +
+          labs(title = "[Proteins] Tenascin", x = "age (weeks)") 
+
+p5
+```
+
+```{r}
+p6 <-
+data$metabolite_batch_corr %>% 
+  transmute(sample_anon, `log2 intensity` = `ethanolamine`) %>% 
+  filter(!is.na(`log2 intensity`)) %>% 
+  left_join(
+    data$annotations %>%  
+      transmute(sample_anon, sample_age_w = as.numeric(sample_age_w)) %>% 
+      distinct()
+  ) 
+
+fig_data$Fig_2_f <- p6
+  
+p6 <- 
+  p6 %>% 
+  ggplot(aes(x = sample_age_w, y = `log2 intensity`)) + 
+          geom_point() +
+          theme_classic() +
+           theme(legend.position = "bottom", legend.direction = "vertical",  text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black")) +
+          geom_smooth(method = lm) +
+          ggpubr::stat_cor(method = "spearman", label.x = 25, label.y.npc = "top", size = 12 / .pt) +
+          labs(title = "[Metabolites] Ethanolamine", x = "age (weeks)") 
+        
+
+p6
+```
+
+
+## Complete figure
+
+```{r}
+figure2 <- ggpubr::ggarrange(
+   ggarrange(p1$plot, p2$plot, p3$plot, labels = c("a", "b", "c"), common.legend = TRUE, legend = "bottom", nrow = 1),
+  ggarrange(p4, p5, p6, labels = c("d", "e", "f"), nrow = 1, label.y = 1.03),
+  nrow = 2
+) 
+
+figure2
+
+ggsave(here::here("univariate_analysis/figures/figure_2.png"), plot=figure2, width=276, height=210, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_2.pdf"), plot=figure2, width=276, height=210, units='mm', dpi=1200)
+
+rm(list = c("p1", "p2", "p3", "p4", "p5", "p6", "proteins", "proteins_calculated", "metabolites", "metabolomics_calculated", "RNASeq", "RNA_calculated", "plot_data"))
+```
+
+
+# Developmental changes
+
+```{r}
+raincloud_plot_age <- function(x, comparison_name, ncol, ylab = "log2 intensity"){
+  x %>% 
+   ggplot(aes(x =  !!rlang::sym(comparison_name), y = value, fill =  !!rlang::sym(comparison_name)))+
+        ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(aes(color =!!rlang::sym(comparison_name)), position = position_jitter(width = .15), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+      scale_color_nejm() +
+      scale_fill_nejm() +
+      facet_wrap(~key, scales = "free_y", ncol = as.numeric(ncol)) +
+      # geom_text(data = dat_text,  mapping = aes(x = 0, y = max_y, label = label),  hjust   = 0 , vjust   = 1) +
+      labs(x = NULL, y = as.character(ylab), color = "Age group", fill = "Age group") +
+      theme_bw() +
+      theme(legend.position = "top", axis.text.x=element_blank(), text=element_text(size=9,  family="Helvetica", colour = "black"), axis.text = element_text(size = 9, colour = "black"), plot.title = element_text(size=9, colour = "black", hjust = 0.5), strip.text.x = element_text(size = 9), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+}
+```
+
+
+```{r}
+calculate_age_groups <- function(x){
+
+            tryCatch(
+              {
+  
+              results <-
+              x %>%
+              filter(!is.na(value)) %>%
+              kruskal.test(value ~ condition, data = .) %>%
+              broom::tidy() %>%
+              transmute(p.value.KW = p.value)  %>%
+              add_column(molecule_name = x$key[1], .before = 1)
+              
+            
+            if(results$p.value.KW < 0.05) {
+              dunntestres <-FSA::dunnTest(x$value, x$condition, method="bh")
+              KW <- 
+                dunntestres[["dtres"]] %>% 
+                as.data.frame() %>% .[4,] %>% as.character() %>% as.data.frame() %>% 
+                rename(mydata = ".") %>% 
+                separate(mydata, into = c("KW chi-sq",  "df", "KW pval"), sep =",") %>% 
+                mutate_all(str_extract, "[0-9]\\.[0-9]+|[0-9]+") %>% 
+                select(-df)
+          
+              results <-
+              bind_cols(
+                results,
+                KW
+                # dunntestres$res
+              ) 
+              
+                zscore_medians <-
+                x %>% 
+                filter(!is.na(value)) %>% 
+                mutate(zscore = (value - mean(value))/sd(value)) %>% 
+                # mutate(zscore = (value - min(value))/(max(value) - min(value))) %>% 
+                group_by(condition) %>% 
+                summarise(zs_median = median(zscore, na.rm = T)) %>% 
+                spread(condition, zs_median)
+                
+                medians <-
+                 x %>% 
+                filter(!is.na(value)) %>% 
+                group_by(condition) %>% 
+                summarise(across(where(is.numeric), 
+                                  list(median = ~ median(.x, na.rm = TRUE),
+                                       n = ~n(),
+                                       Q1 = ~ quantile(.x, 0.25, na.rm = TRUE), 
+                                       Q3 = ~ quantile(.x, 0.75, na.rm = TRUE)))) %>% 
+                mutate_if(is.numeric, round, 2) %>% 
+                mutate(diff_in_medians = max(value_median) - min(value_median)) %>% 
+                gather(key, value, - condition, -diff_in_medians) %>% 
+                separate(key, c("key", "what"), sep = "_(?=Q|m|n)") %>% 
+                spread(what, value) %>% 
+                mutate(numbers = paste0(median, " (", Q1, "-", Q3, ")", ", n=", n),
+                       condition = paste0(condition, "_median")) %>% 
+                select(-median, -Q1, -Q3, -n) %>% 
+                spread(key, numbers) %>% 
+                spread(condition, value) %>% 
+                select(starts_with("0-10 weeks"), starts_with("11-40 weeks"), starts_with("> 40 weeks"),everything())
+     
+              
+               results <-
+              bind_cols(
+                results,
+                zscore_medians, 
+                medians)
+           
+            }
+              return(results)
+           
+              }, error = function(error_condition) {
+              return(NULL)
+            })
+}
+```
+
+## S3a
+
+```{r}
+plot_data <-
+  data$proteomics_before_corr %>% 
+  select(-contains("Bos ")) %>% 
+  left_join(
+    data$annotations %>% 
+       filter(qualified_for_analysis %in% c("yes", "dev_epi")) %>% 
+      transmute(
+          sample_anon,
+          Dev_Age_Grouping_new = as.factor(Dev_Age_Grouping_new) %>% 
+            fct_relevel("0-10 weeks", "11-40 weeks", "> 40 weeks")
+    )
+  )
+
+results <-
+        plot_data %>% 
+          gather(key, value, -sample_anon, -Dev_Age_Grouping_new) %>% 
+          rename(condition = Dev_Age_Grouping_new) %>% 
+          mutate(value = value %>% as.numeric()) %>%
+          split(., .$key) %>%
+          lapply(function(x) {
+            calculate_age_groups(x)
+          })
+
+calculated_stats <- 
+  results %>% 
+  bind_rows() %>% 
+  mutate(p.value.fdr = p.adjust(p.value.KW, method = "BH")) %>% 
+  select(molecule_name, p.value.KW, p.value.fdr, everything()) %>% 
+  filter(p.value.fdr < 0.05) %>% 
+   mutate_if(is.numeric, round, 4) 
+
+calculated_stats
+
+```
+
+```{r}
+library(gplots)
+
+prot_heatmap <-
+calculated_stats %>% 
+  select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name) %>% 
+  rename(`0-10` = 1, `11-40` = 2, `>40` = 3, Proteins = 4)
+
+matrix <- as.matrix(prot_heatmap[,1:3])
+rownames(matrix) <- prot_heatmap$Proteins
+# heatmap.2(matrix)
+gap.stat <-cluster::clusGap(matrix, FUNcluster = kmeans, K.max = 20)
+fviz_gap_stat(gap.stat)
+hclust_rows <- hclust(dist(matrix))  # Calculate hclust dendrograms
+hclust_cols <- hclust(dist(t(matrix)))
+nejm <- pal_nejm("default")(8)
+mycl <-  cutree(hclust_rows, k= 6, h = max(hclust_rows$height) / 1.01)
+# mycolhc <-   nejm(length(unique(mycl)), start = 0.1, end = 0.9)
+mycolhc <- nejm[as.vector(mycl)]
+cluster <- as.matrix(mycl)
+
+output <- cbind(matrix, cluster)
+fig_data$Fig_S3_a <- output %>% as.data.frame() %>% rownames_to_column("molecule")
+
+output_to_save <- cbind(calculated_stats, cluster) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name)) 
+
+table_S3 <- list()
+table_S3$Proteomics <- output_to_save %>% as.data.frame() %>% rownames_to_column("molecule")
+# write.csv(output_to_save, here::here("univariate_analysis/tables/Proteom_clusters_KW_medians_IQR_n.csv"))
+
+p2 <-
+  output %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  gather(key, value, -rowname, -V4) %>% 
+  mutate(key = key %>% as.factor() %>% fct_relevel("0-10", "11-40"),
+         value = as.numeric(value),
+         cluster = as.factor(V4)) %>% 
+  ggplot(aes(x = key, y = value, color = cluster)) +
+  geom_path(aes(group = rowname)) +
+  scale_color_nejm() +
+  facet_wrap(~cluster, scales = "free") +
+  theme_classic() +
+      theme(axis.text.x=element_text(angle=90, hjust=1), legend.position = "none", text=element_text(size=10,  family="Helvetica"), plot.title = element_text(size=12, hjust = 0.5), axis.text = element_text(size=10, colour = "black"), strip.text.x = element_text(size = 10)) +
+  labs(x = NULL, y = "Group's median (Z-scored values)", title = "Proteomics data")
+p2
+ggsave(here::here("univariate_analysis/figures/helpers/clusters_prot.png"), p2, height=90, width=105, units = "mm", dpi  = 1200)
+```
+
+```{r}
+# library(virdis)
+hmcol = colorRampPalette(c("#0072B5FF", "#FBFEF9", "#BC3C29FF"))(100) 
+png(file = here::here("univariate_analysis/figures/helpers/heatmap_prot.png"), height=120, width=150, units = "mm", res  = 1200)
+heatmap.2(
+  matrix,
+  Rowv = as.dendrogram(hclust_rows),
+  Colv = as.dendrogram(hclust_cols),
+   col = hmcol,
+  key.title = "",key.xlab = "Group's median (Z-scored values)",
+  density.info = "none",
+  trace = "none",
+  dendrogram = "both",
+  scale = NULL,
+  labRow = FALSE,
+  labCol = NULL,
+  margins = c(5, 1),
+  RowSideColors = mycolhc,
+  cexCol=1
+  # lmat = rbind(c(0, 3, 0), c(2, 1, 0), c(0,0,4))
+                  # lwid = c(2, 3, 1.5), 
+                  # lhei = c(0.5,6,2), 
+              
+)
+
+dev.off()
+```
+
+## Fig S4
+
+```{r}
+# alpha-fetoprotein, tenascin, C4b-binding protein alpha chain, collagen alpha-1(V) chain, collagen alpha-1(I) chain, complement component C1q receptor, collagen alpha-1(III) chain
+
+vector_of_signif <- c("Alpha-fetoprotein", "Tenascin","C4b-binding protein alpha chain", "Collagen alpha-1(V) chain", "Collagen alpha-1(I) chain", "Complement component C1q receptor", "Collagen alpha-1(III) chain")
+fig_data$Fig_S4 <-
+plot_data %>% 
+  select(sample_anon, vector_of_signif) %>% 
+  left_join(data$annotations %>% select(sample_anon, Dev_Age_Grouping_new)) 
+
+plot_data %>% 
+  select(sample_anon, vector_of_signif) %>% 
+  left_join(data$annotations %>% select(sample_anon, Dev_Age_Grouping_new)) %>% 
+  gather(key, value, -Dev_Age_Grouping_new, -sample_anon) %>% 
+  mutate(value = as.numeric(value)) %>% 
+  raincloud_plot_age("Dev_Age_Grouping_new", ncol = 3, ylab = "log2 intensity")
+
+
+ggsave(here::here("univariate_analysis/figures/figure_S4.pdf"), width=210, height=276, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_S4.png"), width=210, height=276, units='mm', dpi=1200)
+```
+
+## S3b
+
+```{r}
+plot_data <-
+  data$met_batch_VGB_corr %>%
+   left_join(
+    data$annotations %>% 
+       filter(qualified_for_analysis %in% c("yes", "dev_epi")) %>% 
+      transmute(
+          sample_anon,
+          Dev_Age_Grouping_new = as.factor(Dev_Age_Grouping_new) %>% 
+            fct_relevel("0-10 weeks", "11-40 weeks", "> 40 weeks")
+    )
+  )
+```
+
+```{r}
+results <-
+        plot_data %>% 
+          gather(key, value, -sample_anon, -Dev_Age_Grouping_new) %>% 
+          mutate(value = as.numeric(value)) %>% 
+          rename(condition = Dev_Age_Grouping_new) %>% 
+          split(., .$key) %>%
+          lapply(function(x) {
+            calculate_age_groups(x)
+          })
+
+calculated_stats <- 
+  results %>% 
+  bind_rows() %>% 
+  mutate(p.value.fdr = p.adjust(p.value.KW, method = "BH")) %>% 
+  select(molecule_name, p.value.KW, p.value.fdr, everything()) %>% 
+  filter(p.value.fdr < 0.05)
+
+calculated_stats
+```
+
+
+```{r}
+library(gplots)
+
+met_heatmap <-
+calculated_stats %>% 
+  select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name) %>% 
+  rename(`0-10` = 1, `11-40` = 2, `>40` = 3, Metabolites = 4)
+
+matrix <- as.matrix(met_heatmap[,1:3])
+rownames(matrix) <- met_heatmap$Metabolites
+# heatmap.2(matrix)
+
+hclust_rows <- hclust(dist(matrix))  # Calculate hclust dendrograms
+hclust_cols <- hclust(dist(t(matrix)))
+nejm <- pal_nejm("default")(8)
+mycl <-  cutree(hclust_rows, k= 6, h = max(hclust_rows$height) / 1.01)
+# mycolhc <-   nejm(length(unique(mycl)), start = 0.1, end = 0.9)
+mycolhc <- nejm[as.vector(mycl)]
+cluster <- as.matrix(mycl)
+
+output <- cbind(matrix, cluster)
+
+fig_data$Fig_S3_b <- output %>% as.data.frame() %>% rownames_to_column("molecule")
+
+output_to_save <- cbind(calculated_stats, cluster) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name)) 
+table_S3$Metabolomics <- output_to_save %>% as.data.frame() %>% rownames_to_column("molecule")
+
+# write.csv(output_to_save, "Metab_clusters_KW_medians_IQR_n.csv")
+
+p4 <-
+  output %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  gather(key, value, -rowname, -V4) %>% 
+  mutate(key = key %>% as.factor() %>% fct_relevel("0-10", "11-40"),
+         value = as.numeric(value),
+         cluster = as.factor(V4)) %>% 
+  ggplot(aes(x = key, y = value, color = cluster)) +
+  geom_path(aes(group = rowname)) +
+  scale_color_nejm() +
+  facet_wrap(~cluster, scales = "free") +
+  theme_classic() +
+      theme(axis.text.x=element_text(angle=90, hjust=1), legend.position = "none", text=element_text(size=10,  family="Helvetica"), plot.title = element_text(size=12, hjust = 0.5), axis.text = element_text(size=10, colour = "black"), strip.text.x = element_text(size = 10)) +
+  labs(x = NULL, y = "Group's median (Z-scored values)", title = "Metabolite data")
+p4
+ggsave(here::here("univariate_analysis/figures/helpers/clusters_met.png"), p4, height=90, width=125, units = "mm", dpi  = 1200)
+```
+
+
+```{r}
+# library(virdis)
+hmcol = colorRampPalette(c("#0072B5FF", "#FBFEF9", "#BC3C29FF"))(100) 
+png(file = here::here("univariate_analysis/figures/helpers/heatmap_met.png"), height=120, width=150, units = "mm", res  = 1200)
+heatmap.2(
+  matrix,
+  Rowv = as.dendrogram(hclust_rows),
+  Colv = as.dendrogram(hclust_cols),
+   col = hmcol,
+  key.title = "",key.xlab = "Group's median (Z-scored values)",
+  density.info = "none",
+  trace = "none",
+  dendrogram = "both",
+  scale = NULL,
+  labRow = FALSE,
+  labCol = NULL,
+  margins = c(5, 1),
+  RowSideColors = mycolhc,
+  cexCol=1
+  # lmat = rbind(c(0, 3, 0), c(2, 1, 0), c(0,0,4))
+                  # lwid = c(2, 3, 1.5), 
+                  # lhei = c(0.5,6,2), 
+              
+)
+
+dev.off()
+```
+
+## Fig S5
+
+```{r}
+vector_of_signif <- c("ethanolamine", "leucine-isoleucine", "riboflavin", "Kynurenic acid", "glutathione-nega", "shikimate", "aminoimidazole carboxamide ribonucleotide")
+
+fig_data$Fig_S5 <-
+plot_data %>% 
+  select(sample_anon, Dev_Age_Grouping_new, vector_of_signif) 
+
+plot_data %>% 
+  select(sample_anon, Dev_Age_Grouping_new, vector_of_signif) %>% 
+  gather(key, value, -Dev_Age_Grouping_new, -sample_anon) %>% 
+  raincloud_plot_age("Dev_Age_Grouping_new", ncol = 3, ylab = "log2 intensity")
+
+ggsave(here::here("univariate_analysis/figures/figure_S5.pdf"), width=210, height=276, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_S5.png"), width=210, height=276, units='mm', dpi=1200)
+```
+
+## S3c
+
+```{r}
+selected_RNAs <- read_csv(here::here("univariate_analysis/data/names_of_selected_RNAs.csv"))
+
+plot_data <-
+  data$rna_log2_CPM_TMM_before_corr %>% 
+  select(sample_anon, pull(selected_RNAs)) %>% 
+  left_join(
+    data$annotations %>% 
+       filter(qualified_for_analysis %in% c("yes", "dev_epi")) %>% 
+      transmute(
+          sample_anon,
+          Dev_Age_Grouping_new = as.factor(Dev_Age_Grouping_new) %>% 
+            fct_relevel("0-10 weeks", "11-40 weeks", "> 40 weeks")
+    )
+  ) %>%  
+  filter(!is.na(Dev_Age_Grouping_new))
+```
+
+```{r}
+results <-
+        plot_data %>% 
+          gather(key, value, -sample_anon, -Dev_Age_Grouping_new) %>% 
+          rename(condition = Dev_Age_Grouping_new) %>% 
+  mutate(value = as.numeric(value)) %>% 
+          split(., .$key) %>%
+          lapply(function(x) {
+     calculate_age_groups(x)
+          })
+
+calculated_stats <- 
+  results %>% 
+  bind_rows() %>% 
+  mutate(p.value.fdr = p.adjust(p.value.KW, method = "BH")) %>% 
+  select(molecule_name, p.value.KW, p.value.fdr, everything()) %>% 
+  filter(p.value.fdr < 0.05)
+
+calculated_stats
+```
+
+```{r}
+# save data
+RNA_heatmap <-
+calculated_stats %>% 
+  select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name) %>% 
+  rename(`0-10` = 1, `11-40` = 2, `>40` = 3, RNA = 4) %>% 
+  filter(!(RNA %in% c("ENSG00000012817", "ENSG00000067048", "ENSG00000114374"))) 
+matrix <- as.matrix(RNA_heatmap[,1:3])
+rownames(matrix) <- RNA_heatmap$RNA
+
+to_save <-
+calculated_stats %>% 
+  select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name) %>% 
+  rename(`0-10` = 1, `11-40` = 2, `>40` = 3, RNA = 4) %>% 
+  filter(!(RNA %in% c("ENSG00000012817", "ENSG00000067048", "ENSG00000114374"))) %>% 
+  add_column("V4" = NA)
+# heatmap.2(matrix)
+matrix_tosave <- as.matrix(to_save[,1:3])
+rownames(matrix_tosave) <- to_save$RNA
+
+hclust_rows <- hclust(dist(matrix))  # Calculate hclust dendrograms
+hclust_cols <- hclust(dist(t(matrix)))
+nejm <- pal_nejm("default")(8)
+mycl <-  cutree(hclust_rows, k= 8, h = max(hclust_rows$height) / 1.01)
+# mycolhc <-   nejm(length(unique(mycl)), start = 0.1, end = 0.9)
+mycolhc <- nejm[as.vector(mycl)]
+cluster <- as.matrix(mycl)
+
+output <- cbind(matrix, cluster)
+# saveme <-rbind(output,to_save)
+fig_data$Fig_S3_c <-  output %>% as.data.frame() %>% rownames_to_column("molecule")
+
+# output_to_save <- cbind(calculated_stats, cluster) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name))
+
+output_to_save <- cbind(calculated_stats %>%filter(!(molecule_name %in% c("ENSG00000012817", "ENSG00000067048", "ENSG00000114374"))), cluster) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name))
+
+output_to_save <-
+  rbind(
+    output_to_save %>% rownames_to_column(var = "molecule_name"),
+    calculated_stats %>%filter((molecule_name %in% c("ENSG00000012817", "ENSG00000067048", "ENSG00000114374"))) %>% add_column("cluster" = NA) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`)))
+
+
+table_S3$RNASeq <- output_to_save %>% as.data.frame() %>% rownames_to_column("molecule")
+
+```
+
+
+```{r}
+library(gplots)
+# prot_heatmap <- 
+#   read_excel(here::here("additional/results/Copy of THSD-Values Age Effect.xlsx"), 
+#     sheet = "Proteins") %>% select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, Proteins) %>% 
+#   rename(`0-10` = 1, `11-40` = 2, `>40` = 3)
+
+RNA_heatmap <-
+calculated_stats %>% 
+  select(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name) %>% 
+  rename(`0-10` = 1, `11-40` = 2, `>40` = 3, RNA = 4) 
+
+
+matrix <- as.matrix(RNA_heatmap[,1:3])
+rownames(matrix) <- RNA_heatmap$RNA
+# heatmap.2(matrix)
+
+hclust_rows <- hclust(dist(matrix))  # Calculate hclust dendrograms
+hclust_cols <- hclust(dist(t(matrix)))
+nejm <- pal_nejm("default")(8)
+mycl <-  cutree(hclust_rows, k= 8, h = max(hclust_rows$height) / 1.01)
+# mycolhc <-   nejm(length(unique(mycl)), start = 0.1, end = 0.9)
+mycolhc <- nejm[as.vector(mycl)]
+cluster <- as.matrix(mycl)
+
+output <- cbind(matrix, cluster)
+
+fig_data$Fig_S3_c <-  output %>% as.data.frame() %>% rownames_to_column("molecule")
+
+output_to_save <- cbind(calculated_stats, cluster) %>% select(-c(`0-10 weeks`, `11-40 weeks`, `> 40 weeks`, molecule_name),  -contains("NA"))
+
+table_S3$RNASeq <- output_to_save
+```
+
+
+```{r}
+p6 <-
+  output %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  gather(key, value, -rowname, -V4) %>% 
+  mutate(key = key %>% as.factor() %>% fct_relevel("0-10", "11-40"),
+         value = as.numeric(value),
+         cluster = as.factor(V4)) %>% 
+  ggplot(aes(x = key, y = value, color = cluster)) +
+  geom_path(aes(group = rowname)) +
+  scale_color_nejm() +
+  facet_wrap(~cluster, scales = "free", nrow = 2) +
+  theme_classic() +
+      theme(axis.text.x=element_text(angle=90, hjust=1), legend.position = "none", text=element_text(size=10,  family="Helvetica"), plot.title = element_text(size=12, hjust = 0.5), axis.text = element_text(size=10, colour = "black"), strip.text.x = element_text(size = 10)) +
+  labs(x = NULL, y = "Group's median (Z-scored values)", title = "Transcriptomic data")
+p6
+ggsave(here::here("univariate_analysis/figures/helpers/clusters_RNA.png"), p6, height=90, width=125, units = "mm", dpi  = 1200)
+```
+
+
+```{r}
+# library(virdis)
+hclust_cols$merge <- cbind(c(-1, 1), c(-2, -3))
+hmcol = colorRampPalette(c("#0072B5FF", "#FBFEF9", "#BC3C29FF"))(100) 
+png(file = here::here("univariate_analysis/figures/helpers/heatmap_RNA.png"), height=120, width=150, units = "mm", res  = 1200)
+heatmap.2(
+  matrix,
+  Rowv = as.dendrogram(hclust_rows),
+  Colv = as.dendrogram(hclust_cols),
+   col = hmcol,
+  key.title = "",
+  key.xlab = "Group's median (Z-scored values)",
+  density.info = "none",
+  trace = "none",
+  dendrogram = "both",
+  scale = NULL,
+  labRow = FALSE,
+  labCol = NULL,
+  margins = c(5, 1),
+  RowSideColors = mycolhc,
+  cexCol=1
+)
+
+dev.off()
+```
+
+## Fig S6
+
+```{r}
+vector_of_signif <- c("ENSG00000196565", "ENSG00000115363", "ENSG00000213934", "ENSG00000026559")
+
+plot_data %>% 
+  select(sample_anon, "ENSG00000229807") %>% 
+  rename(XIST = ENSG00000229807) %>% 
+  left_join(
+    data$annotations %>% select(sample_anon, sample_age_w, sex, TSC_mutation, Condition) %>% 
+      mutate(sample_age_w = sample_age_w %>% as.numeric())
+  ) %>% 
+  gather(variable, value, -sample_anon, -XIST, -sample_age_w) %>% 
+  ggplot(aes(x=sample_age_w, y = XIST, color = value)) +
+geom_point()+
+  facet_wrap(~variable, scales = "free") +
+    theme_bw() 
+
+xist <-
+plot_data %>% 
+  transmute(sample_anon, XIST = ENSG00000229807, Dev_Age_Grouping_new) %>% 
+  left_join(
+    data$annotations %>% select(sample_anon, sample_age_w, sex) %>% 
+      mutate(sample_age_w = sample_age_w %>% as.numeric(), sex = as.factor(sex))
+  ) %>% 
+  ggplot(aes(x=Dev_Age_Grouping_new, y = XIST, color = Dev_Age_Grouping_new, fill = Dev_Age_Grouping_new)) +
+       ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(position = position_jitter(width = .15), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+      scale_color_nejm() +
+      scale_fill_nejm() +
+      facet_wrap(~"XIST"+sex) +
+      # geom_text(data = dat_text,  mapping = aes(x = 0, y = max_y, label = label),  hjust   = 0 , vjust   = 1) +
+      labs(x = NULL, y = NULL, color = "Age group", fill = "Age group") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x=element_blank(), text=element_text(size=9,  family="Helvetica", colour = "black"), axis.text = element_text(size = 9, colour = "black"), plot.title = element_text(size=9, colour = "black", hjust = 0.5), strip.text.x = element_text(size = 9), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+
+xist
+```
+
+
+```{r}
+fig_data$Fig_S6 <-
+plot_data %>% 
+  select(sample_anon, Dev_Age_Grouping_new, vector_of_signif)
+
+myplots <- plot_data %>% 
+  select(sample_anon, Dev_Age_Grouping_new, vector_of_signif, -ENSG00000026559) %>% 
+  rename(HBG2 = ENSG00000196565, EVA1A= ENSG00000115363,  HBG1 = ENSG00000213934) %>% 
+  gather(key, value, -Dev_Age_Grouping_new, -sample_anon) %>% 
+  raincloud_plot_age("Dev_Age_Grouping_new", ncol = 4, ylab = "log2 count")
+
+KCNG1 <-
+plot_data %>% 
+  transmute(sample_anon, KCNG1 = ENSG00000026559, Dev_Age_Grouping_new) %>% 
+  left_join(
+    data$annotations %>% select(sample_anon, sample_age_w, sex) %>% 
+      mutate(sample_age_w = sample_age_w %>% as.numeric())
+  ) %>% 
+  ggplot(aes(x=Dev_Age_Grouping_new, y = KCNG1, color = Dev_Age_Grouping_new, fill = Dev_Age_Grouping_new)) +
+       ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(position = position_jitter(width = .15), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+      scale_color_nejm() +
+      scale_fill_nejm() +
+      facet_wrap(~"KCNG1", scales = "free_y") +
+      # geom_text(data = dat_text,  mapping = aes(x = 0, y = max_y, label = label),  hjust   = 0 , vjust   = 1) +
+      labs(x = NULL, y = as.character("log2 count"), color = "Age group", fill = "Age group") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x=element_blank(), text=element_text(size=9,  family="Helvetica", colour = "black"), axis.text = element_text(size = 9, colour = "black"), plot.title = element_text(size=9, colour = "black", hjust = 0.5), strip.text.x = element_text(size = 9), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+
+ggarrange(myplots, ggarrange(KCNG1, xist, widths = c(0.35, 0.65)), nrow = 2, common.legend = T)
+
+ggsave(here::here("univariate_analysis/figures/figure_S6.pdf"), width=210, height=276, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_S6.png"), width=210, height=276, units='mm', dpi=1200)
+```
+
+## S3 - Final figure
+
+```{r}
+heat1 <- png::readPNG(here::here("univariate_analysis/figures/helpers/heatmap_prot.png"))
+heat2 <- png::readPNG(here::here("univariate_analysis/figures/helpers/heatmap_met.png"))
+heat3 <- png::readPNG(here::here("univariate_analysis/figures/helpers/heatmap_RNA.png"))
+clust1 <- png::readPNG(here::here("univariate_analysis/figures/helpers/clusters_prot.png"))
+clust2 <- png::readPNG(here::here("univariate_analysis/figures/helpers/clusters_met.png"))
+clust3 <- png::readPNG(here::here("univariate_analysis/figures/helpers/clusters_RNA.png"))
+library(grid)
+tmp <- ggarrange(rasterGrob(heat1),rasterGrob(clust1), rasterGrob(heat2), rasterGrob(clust2), rasterGrob(heat3), rasterGrob(clust3), labels = c("a", "", "b", "", "c", ""), label.y = 0.75, ncol=2, nrow = 3)
+tmp
+
+ggsave(here::here("univariate_analysis/figures/figure_S3.pdf"), plot=tmp, width=210, height=276, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_S3.png"), plot=tmp, width=210, height=276, units='mm', dpi=1200)
+
+openxlsx::write.xlsx(table_S3, here::here("univariate_analysis/tables/Table_S3.xlsx"))
+```
+
+# Fig S7
+
+```{r}
+library("RColorBrewer")
+library(Hmisc)
+library(viridis)
+library(corrplot)
+
+annotation<-read.delim(file=here::here("univariate_analysis/data/csort/Annot.txt"),header=TRUE)
+
+####Before age correction
+expression2<-read.delim(file=here::here("univariate_analysis/data/csort/RNAseq_Results.txt"),header=TRUE)
+row.names(expression2)<-expression2$X
+expression2<-expression2[,c(2:291)]
+
+csort<-read.delim(file=here::here("univariate_analysis/data/csort/Cell_Proportions_RNASeq_James.csv"),header=TRUE,row.names = 1,sep=",")
+
+###Filter the file out of the RNASeq annotation
+
+annotation<-subset(annotation,annotation$GSID..RNA.seq.raw.file.!="NA")
+annotation$GSID..RNA.seq.raw.file.<-sub("^","X",annotation$GSID..RNA.seq.raw.file.)
+annotation$GSID..RNA.seq.raw.file.<-gsub("-",".",annotation$GSID..RNA.seq.raw.file.)
+annotation<-annotation[order(annotation$GSID..RNA.seq.raw.file.),]
+annotation<-subset(annotation,annotation$qualified_for_analysis!="no")
+annotation<-annotation[-c(236:242),]
+annotation<-annotation[-c(243:249),]
+annotation<-annotation[-c(258:263),]
+annotation<-annotation[-c(261:266),]
+
+row.names(annotation)<-annotation$GSID..RNA.seq.raw.file.
+
+temp<-colnames(expression2)
+temp<-as.data.frame(temp)
+annotation<-merge(temp,annotation,by.x=1,by.y=0)
+row.names(annotation)<-annotation$temp
+
+temp<-row.names(annotation)
+csort<-select(csort,!!temp)
+
+####Gene list for RNA-Seq
+
+genes<-read.csv(file=here::here("univariate_analysis/data/csort/names_of_selected_RNAs.csv"),header=TRUE)
+expression2<-merge(genes,expression2,by.x=1,by.y=0)
+row.names(expression2)<-expression2$names
+expression2<-expression2[,c(2:291)]
+
+#Removing incomplete cases from the expression data 
+expression<-expression2
+expression<-expression[complete.cases(expression),]
+
+#Lets work out the PCA for the expression data
+
+pca.cal<-prcomp(t(expression))
+pca.cal<-pca.cal$x
+pca.cal<-as.data.frame(pca.cal)
+
+corr<-merge(annotation,pca.cal,by=0)
+row.names(corr)<-corr$Row.names
+corr<-corr[,c(23,79:88)]
+
+cortt<-t(csort)
+cortt<-cortt[,-c(8,10,17,20)]
+corr<-merge(corr,cortt,by.x=0,by.y = 0)
+row.names(corr)<-corr$Row.names
+corr<-corr[,c(2:30)] 
+
+fig_data$Fig_S7_a <- corr
+
+corr<-as.matrix(corr)
+x<-Hmisc::rcorr(corr,type="spearman")
+
+plot<-x$r[-c(2:11), 1:11]
+
+pvalues<-x$P[-c(2:11), 1:11]
+
+col5<-viridis(10)
+library(grid)
+library(gridExtra)
+png(height=160, width=160, units = "mm", res  = 1200, 
+    file=here::here("univariate_analysis/figures/helpers/csort_corrplot.png"), type = "cairo")
+corrplot(plot,col = col5,tl.col="black")
+dev.off()
+```
+
+```{r}
+CIBERSORT_EPISTOP <- read_csv(here::here("univariate_analysis/data/csort/CIBERSORT_EPISTOP.csv"))
+
+CIBERSORT_EPISTOP <-
+CIBERSORT_EPISTOP %>% 
+  rename(RNA_original_file_name = Mixture) %>% 
+  mutate(RNA_original_file_name = str_remove(RNA_original_file_name, "^X") %>% str_replace_all(., "\\.", "-")) %>% 
+  left_join(
+    data$annotations %>%  
+      select(sample_anon, RNA_original_file_name, sample_age_w) %>% 
+      distinct()
+  )
+
+CIBERSORT_EPISTOP <-
+CIBERSORT_EPISTOP %>% 
+   select(sample_anon, sample_age_w, `T cells CD4 naive`, Monocytes, Neutrophils)
+
+# CIBERSORT_EPISTOP %>% count(!is.na(sample_age_w)) # 36	has no age
+fig_data$Fig_S7_b <- CIBERSORT_EPISTOP
+
+CIBERSORT_EPISTOP_plot <-
+CIBERSORT_EPISTOP %>% 
+  filter(!is.na(sample_age_w)) %>% 
+  gather(key, value, -sample_anon, -sample_age_w) %>% 
+  mutate(sample_age_w = as.numeric(sample_age_w)) %>% 
+  ggplot(aes(x = sample_age_w, y = value, color = key)) +
+  scale_color_nejm() +
+  geom_point() +
+  facet_wrap(~key, ncol = 1) +
+  geom_smooth(method = lm) +
+  ggpubr::stat_cor(method = "spearman", label.x = 25, label.y = 0.4, size = 5) +
+   theme_classic() +
+          theme(legend.position = "none", legend.direction = "vertical",  text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black"), strip.text.x = element_text(size = 12)) +
+  labs(x = "age [weeks]", y = "% of cell type in sample")
+
+CIBERSORT_EPISTOP_plot
+```
+
+## Complete figure
+
+```{r}
+plot2 <- png::readPNG(here::here('univariate_analysis/figures/helpers/csort_corrplot.png'))
+
+tmp <- ggarrange(grid::rasterGrob(plot2), CIBERSORT_EPISTOP_plot, labels = c("a", "b"), label.y = 0.85, ncol=2)
+
+ggsave("figure_S7.pdf", plot=tmp, width=276, height=210, units='mm', dpi=1200)
+ggsave("figure_S7.png", plot=tmp, width=276, height=210, units='mm', dpi=1200)
+```
+
+# Fig S2
+
+## S2a
+
+```{r}
+metabolites<-
+   data$metabolite_before_corr
+
+convert2matrix<-function(x) {
+    m<-as.matrix(x[,-1])
+    rownames(m)<-x[[1]]
+    m
+}
+
+library(factoextra)
+data_matrix <- convert2matrix(metabolites)
+  data_matrix <- data_matrix[ , colSums(is.na(data_matrix)) == 0]
+  data_matrix <- data_matrix[,!is.infinite(colSums(data_matrix))]
+  
+  res.pca <- prcomp(data_matrix, scale = F) 
+ 
+  groups <- 
+    data.frame(sample_anon = rownames(data_matrix)) %>% 
+      left_join(data$annotations %>%
+        mutate(sample_anon = as.character(sample_anon)) %>% 
+      select(sample_anon, `Metabolomics Batch #`), by = "sample_anon") %>% 
+      distinct() %>% 
+    na.omit()
+ 
+   met_batch <-
+  fviz_pca_ind(res.pca,
+               col.ind = as.factor(groups$`Metabolomics Batch #`),
+               legend.title = "Batch ID",
+               palette= "nejm",
+               geom = "point"
+               ) +
+    labs(title = "Metabolomic data (before batch correction) \n grouped by batch ID") +
+    theme_classic() +
+    theme(legend.position = "bottom",  text=element_text(size=12,  family="Helvetica", colour = "black"), plot.title = element_text(size=12, colour = "black"), axis.text = element_text(size=12, colour = "black"))
+  
+    fig_data$Fig_S2_a <- 
+    res.pca[["x"]][, 1:2] %>% as.data.frame() %>% rownames_to_column("sample_anon") %>% left_join(groups)
+```
+
+## S2b
+
+```{r}
+metabolites<-
+    data$metabolite_batch_corr
+
+data_matrix <- convert2matrix(metabolites)
+  data_matrix <- data_matrix[ , colSums(is.na(data_matrix)) == 0]
+  data_matrix <- data_matrix[,!is.infinite(colSums(data_matrix))]
+  
+  res.pca <- prcomp(data_matrix, scale = F) 
+ 
+  groups <- 
+    data.frame(sample_anon = rownames(data_matrix)) %>% 
+      left_join(data$annotations %>%
+        mutate(sample_anon = as.character(sample_anon)) %>% 
+      select(sample_anon, `Metabolomics Batch #`), by = "sample_anon") %>% 
+      distinct() %>% 
+    na.omit()
+  
+ met_after_batch <-
+  fviz_pca_ind(res.pca,
+               col.ind = as.factor(groups$`Metabolomics Batch #`),
+               legend.title = "Batch ID",
+               palette= "nejm",
+               geom = "point"
+               ) +
+    labs(title = "Metabolomic data (after batch correction)") +
+    theme_classic() +
+    theme(legend.position = "bottom",  text=element_text(size=12,  family="Helvetica", colour = "black"), plot.title = element_text(size=12, colour = "black"), axis.text = element_text(size=12, colour = "black"))
+ 
+ fig_data$Fig_S2_b <- 
+    res.pca[["x"]][, 1:2] %>% as.data.frame() %>% rownames_to_column("sample_anon") %>% left_join(groups)
+```
+
+
+```{r}
+fig2ab <- ggarrange(met_batch, met_after_batch, common.legend = T, labels = c("a", "b"))
+```
+
+## S2c
+
+```{r}
+data_before_correction <- 
+  data$proteomics_before_corr %>% 
+  select(sample_anon, `C4b-binding protein alpha chain`)
+
+data_ZS_corr <-
+  data$proteomics_ZScore_age_corr %>% 
+  select(sample_anon, `C4b-binding protein alpha chain`)
+
+data_MM_corr <-
+  data$proteomics_MM_age_corr %>% 
+  select(sample_anon, `C4b-binding protein alpha chain`)
+
+plot_data <-
+bind_rows(
+  data_before_correction,
+  data_ZS_corr,
+  data_MM_corr,
+  .id = "datatype"
+) %>% 
+  mutate(datatype = case_when(
+   datatype == 1 ~ "before correction", 
+    datatype == 2 ~ "Z-Score correction", 
+    datatype == 3 ~"Mixed-model correction")
+   ) %>%
+  left_join(
+    data$annotations %>%  
+      select(sample_anon, sample_age_w) %>% 
+      distinct()
+  ) %>% 
+  rename(value = `C4b-binding protein alpha chain`) %>% 
+  mutate(value = as.numeric(value)) 
+
+figure_2c <-
+plot_data %>% 
+   ggplot(aes(x = as.numeric(sample_age_w), y = value)) + 
+          geom_point() +
+          theme_bw() +
+          theme( legend.position = "bottom", legend.direction = "vertical") +
+          geom_smooth(method = lm) +
+          ggpubr::stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+          facet_wrap(~datatype) +
+          labs(x = "age (weeks)", y = "log2 intensity", title = "C4b-binding protein alpha chain") +
+          theme_classic() +
+          theme(legend.position = "bottom", legend.direction = "vertical",  text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black"), strip.text.x = element_text(size = 12)) 
+
+fig_data$Fig_S2_c <- plot_data
+```
+
+## Complete figure
+
+```{r}
+fig2abc <-
+  ggarrange(fig2ab, figure_2c, ncol = 1, labels = c("", "c"))
+ggsave("figure_S2.png", fig2abc, height=276, width=210, units = "mm", dpi  = 1200)
+ggsave("figure_S2.pdf", fig2abc, height=276, width=210, units = "mm", dpi  = 1200)
+```
+
+
+# Hypothesis testing
+
+```{r}
+prot_ZS_corr <-
+data$proteomics_ZScore_age_corr %>% 
+  gather(molecule, value, - sample_anon) %>% 
+  spread(sample_anon, value) %>% 
+  separate(molecule, "molecule", sep = ";") %>% 
+  add_column(correction = "Z-Score", .before = 1) %>% 
+  add_column(dataset = "Proteins", .before = 1)
+
+prot_MM_corr <-
+  data$proteomics_MM_age_corr %>% 
+  gather(molecule, value, - sample_anon) %>% 
+  spread(sample_anon, value) %>% 
+  separate(molecule, "molecule", sep = ";") %>% 
+  add_column(correction = "Mixed-model", .before = 1) %>% 
+  add_column(dataset = "Proteins", .before = 1)
+
+metabolites_ZS_corr<-
+data$met_batch_VGB_ZS_age_corr %>% 
+   add_column(correction = "Z-Score", .before = 1) %>% 
+  add_column(dataset = "Metabolites", .before = 1) 
+
+metabolites_MM_corr <-
+  data$met_batch_VGB_MM_age_corr %>% 
+   add_column(correction = "Mixed-model", .before = 1) %>% 
+  add_column(dataset = "Metabolites", .before = 1) 
+
+selected_RNAs <- read_csv(here::here("univariate_analysis/data/names_of_selected_RNAs.csv"))
+
+convertGeneIDs <- 
+  read_csv(here::here("univariate_analysis/data/convertGeneIDs.csv")) %>% 
+  distinct(ensembl_gene_id,hgnc_symbol, keep_all = T)
+
+RNA_ZS_corr <-
+  data$rna_log2_CPM_TMM_ZS_age_corr %>% 
+  select(sample_anon, pull(selected_RNAs)) %>% 
+  gather(molecule, value, - sample_anon) %>% 
+  spread(sample_anon, value) %>% 
+  add_column(correction = "Z-Score", .before = 1) %>% 
+  add_column(dataset = "RNASeq", .before = 1) %>% 
+  left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("molecule" = "ensembl_gene_id")) %>% 
+  mutate(molecule = if_else(!is.na(hgnc_symbol), hgnc_symbol, molecule)) %>% 
+  select(-hgnc_symbol)
+   
+RNA_MM_corr <-
+  data$rna_log2_CPM_TMM_MM_age_corr %>% 
+  select(sample_anon, pull(selected_RNAs)) %>% 
+  gather(molecule, value, - sample_anon) %>% 
+  spread(sample_anon, value) %>% 
+  add_column(correction = "Mixed-model", .before = 1) %>% 
+  add_column(dataset = "RNASeq", .before = 1) %>% 
+  left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("molecule" = "ensembl_gene_id")) %>% 
+  mutate(molecule = if_else(!is.na(hgnc_symbol), hgnc_symbol, molecule)) %>% 
+  select(-hgnc_symbol)
+
+proteomics_intersection <- read_excel(here::here("univariate_analysis/hypothesis_testing/results/intersection_two_way_comp/proteomics_intersection.xlsx"))
+metabolomics_intersection <- read_excel(here::here("univariate_analysis/hypothesis_testing/results/intersection_two_way_comp/metabolomics_intersection.xlsx"))
+RNA_intersection <- read_excel(here::here("univariate_analysis/hypothesis_testing/results/intersection_two_way_comp/RNASeq_intersection.xlsx"))
+
+proteomics_intersection_KW <- read_csv(here::here("univariate_analysis/hypothesis_testing/results/Intersections_KW/intersection_both_methods_KW_prot.csv"))
+metabolomics_intersection_KW <-read_csv(here::here("univariate_analysis/hypothesis_testing/results/Intersections_KW/intersection_both_methods_KW_met.csv"))
+RNA_intersection_KW <- read_csv(here::here("univariate_analysis/hypothesis_testing/results/Intersections_KW/intersection_both_methods_KW_RNA.csv"))
+```
+
+
+```{r}
+raincloud_plot_comp <- function(x, comparison_name, ylab = "log2 intensity"){
+  x %>% 
+   ggplot(aes(x =  !!rlang::sym(comparison_name), y = value, fill =  !!rlang::sym(comparison_name)))+
+        ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(aes(color =!!rlang::sym(comparison_name)), position = position_jitter(width = .15), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+      scale_color_nejm() +
+      scale_fill_nejm() +
+      facet_wrap(~correction, ncol = 2) +
+      labs(x = NULL, y = ylab, title = x$molecule[1], fill = NULL, color = NULL) +
+    theme_classic() +
+      theme(legend.position = "none",
+                axis.text.x= element_blank(),#element_text(angle=60, hjust=1),
+                text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black"), strip.text.x = element_text(size = 10), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+}
+```
+
+
+## Fig S8
+
+```{r}
+signif_molecule_prot <-
+proteomics_intersection %>% filter(intersection == "Yes") %>% filter(str_detect(comparison, "FT01|FT02")) %>% 
+  select(-zs_fold, -intersection) %>% 
+  group_by(feature) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  pull(feature)
+
+signif_molecule_met <-
+metabolomics_intersection %>% filter(intersection == "Yes") %>% filter(str_detect(comparison, "FT01|FT02")) %>% 
+  select(-zs_fold, -intersection) %>% 
+  distinct(comparison, feature, .keep_all = T) %>%
+  group_by(feature) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  filter(n > 1) %>% 
+  pull(feature)
+
+signif_molecule_RNA <- 
+RNA_intersection %>% filter(intersection == "Yes") %>% filter(str_detect(comparison, "FT01|FT02")) %>%
+  mutate(comparison = str_extract(comparison, "FT\\d{2}")) %>% 
+    select(-zs_fold, -intersection) %>% 
+  distinct(comparison, gene, .keep_all = T) %>% 
+  group_by(gene) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  pull(gene)
+
+signif_molecule_RNA <- c("ENSG00000049323", "ENSG00000106714", "ENSG00000109475", "ENSG00000121552", "ENSG00000125691", "ENSG00000141837", "ENSG00000143546", "ENSG00000144426", "ENSG00000149177", "ENSG00000165905", "ENSG00000169020", "ENSG00000185338", "ENSG00000198918", "ENSG00000211640", "ENSG00000211942", "ENSG00000212664", "ENSG00000213741", "ENSG00000224550", "ENSG00000226221", "ENSG00000227008", "ENSG00000227063", "ENSG00000227081", "ENSG00000229117", "ENSG00000235174", "ENSG00000235957", "ENSG00000236439", "ENSG00000241755", "ENSG00000242445", "ENSG00000243264", "ENSG00000244398", "ENSG00000253683", "ENSG00000256968", "ENSG00000258429", "ENSG00000259207")
+
+signif_molecule_RNA <-
+signif_molecule_RNA %>% 
+  as.data.frame() %>% 
+  rename(ensembl_gene_id = 1) %>% 
+  left_join(convertGeneIDs %>% distinct(ensembl_gene_id, hgnc_symbol)) %>% 
+  mutate(hgnc_symbol = if_else(is.na(hgnc_symbol), ensembl_gene_id,hgnc_symbol))
+```
+
+
+```{r}
+plot_data <-
+bind_rows(
+  bind_rows(
+    prot_ZS_corr %>% filter(molecule %in% signif_molecule_prot),
+    prot_MM_corr %>% filter(molecule %in% signif_molecule_prot)) %>%  
+    gather(sample_anon, value,-dataset, -correction, -molecule) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`) %>% 
+        distinct()
+    ) %>% 
+    filter(!is.na(`(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`)) %>% 
+    mutate(value = as.numeric(value)),
+bind_rows(
+  bind_rows(
+    metabolites_ZS_corr %>% select(dataset, correction, sample_anon, signif_molecule_met),
+    metabolites_MM_corr %>% select(dataset, correction, sample_anon, signif_molecule_met)
+    ) %>% 
+    gather(molecule, value,-dataset, -correction, -sample_anon) %>% 
+  mutate(sample_anon = as.character(sample_anon)) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`) %>% 
+        distinct()
+    )
+            ),
+bind_rows(
+    RNA_ZS_corr %>% filter(molecule %in% signif_molecule_RNA$hgnc_symbol),
+    RNA_MM_corr %>% filter(molecule %in% signif_molecule_RNA$hgnc_symbol)
+    ) %>% 
+    gather(sample_anon, value,-dataset, -correction, -molecule) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`) %>% 
+        distinct()
+    ) %>% 
+    filter(!is.na(`(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`)) %>% 
+    mutate(value = as.numeric(value))
+) %>% 
+  filter(!is.na(value))
+
+fig_data$Fig_S8 <- plot_data
+
+p_rna <-
+plot_data %>% 
+   filter(dataset == "RNASeq") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT01) TSC (no VGB, no seizure history) vs Control (central corr)", ylab = "log2 counts")
+  })
+
+p_prot <-
+  plot_data %>% 
+   filter(dataset ==  "Proteins") %>% #"Metabolites") %>%
+  filter(!is.na(`(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`)) %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+  raincloud_plot_comp(x, "(FT01) TSC (no VGB, no seizure history) vs Control (central corr)")
+  }) 
+
+# ggarrange(plotlist=p_prot, common.legend = T)
+
+p_met <-
+plot_data %>% 
+   filter(dataset == "Metabolites") %>%
+    filter(!is.na(`(FT01) TSC (no VGB, no seizure history) vs Control (central corr)`)) %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+  raincloud_plot_comp(x, "(FT01) TSC (no VGB, no seizure history) vs Control (central corr)")
+  })
+```
+
+```{r}
+ggpubr::ggarrange(
+  ggarrange(
+    ggarrange(plotlist=p_prot, common.legend = T, nrow =1), 
+    ggarrange(plotlist=p_met, common.legend = T,nrow =1),
+    common.legend = T,
+    widths = c(0.6,0.4),
+    labels = c("a", "b")
+  ),
+  ggpubr::ggarrange(plotlist=p_rna, common.legend = T, labels = "c"), 
+  nrow = 2, 
+   heights = c(0.2, 0.8),
+  common.legend = T
+  ) 
+
+ggsave(here::here("univariate_analysis/figures/figure_S8.pdf"), width=330, height=450, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_S8.png"), width=330, height=450, units='mm', dpi=1200)
+```
+
+## Fig 3
+
+```{r}
+signif_molecule_prot <-
+proteomics_intersection %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison, "FT19")) %>% 
+  pull(feature)
+
+signif_molecule_met <-
+metabolomics_intersection %>% filter(intersection == "Yes") %>% filter(str_detect(comparison, "19")) %>% 
+  pull(feature)
+
+plot_data <-
+  bind_rows(
+    bind_rows(
+      prot_ZS_corr %>% filter(molecule %in% signif_molecule_prot),
+      prot_MM_corr %>% filter(molecule %in% signif_molecule_prot)) %>%  
+      gather(sample_anon, value,-dataset, -correction, -molecule) %>% 
+      left_join(
+        data$annotations %>%  
+          select(sample_anon, `(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)`) %>% 
+          distinct()
+      ) %>% 
+      filter(!is.na(`(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)`)) %>% 
+      mutate(value = as.numeric(value)),
+    bind_rows(
+    metabolites_ZS_corr %>% select(dataset, correction, sample_anon, signif_molecule_met),
+    metabolites_MM_corr %>% select(dataset, correction, sample_anon, signif_molecule_met)
+    ) %>% 
+    gather(molecule, value,-dataset, -correction, -sample_anon) %>% 
+  mutate(sample_anon = as.character(sample_anon)) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)`) %>% 
+        distinct()
+    ) %>% 
+     filter(!is.na(`(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)`))
+  )
+
+fig_data$Fig_3 <- plot_data
+
+p_met <-
+plot_data %>% 
+   filter(dataset == "Metabolites") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)")
+  })
+
+p_prot <-
+plot_data %>% 
+   filter(dataset == "Proteins") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT19) V24 - resistant Epilepsy at V24 (no Epi and no resistant Epi at V24 combined)")
+  })
+
+
+ggarrange(plotlist=c(p_prot, p_met), labels = c("a", "b"), common.legend = T)
+
+
+ggsave("figure_3.pdf", width=150, height=150, units='mm', dpi=1200)
+ggsave("figure_3.png", width=150, height=150, units='mm', dpi=1200)
+
+
+```
+
+
+## Fig 4
+
+```{r}
+signif_molecule_prot <-
+proteomics_intersection_KW %>% filter(intersection == "Yes") %>% filter(!str_detect(comparison, "FT01|FT02|FT19")) %>% 
+  select(-zs_fold, -intersection, -groups) %>% 
+  distinct(comparison, molecule_name, .keep_all = T) %>%
+  group_by(molecule_name ) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  filter(n == 4) %>% 
+  pull(molecule_name )
+
+signif_molecule_met <-
+metabolomics_intersection_KW %>% filter(intersection == "Yes") %>% filter(!str_detect(comparison, "FT01|FT02|FT19")) %>% 
+  select(-zs_fold, -intersection, -groups) %>% 
+  distinct(comparison, molecule_name, .keep_all = T) %>%
+  group_by(molecule_name) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  filter(n == 4) %>% 
+  pull(molecule_name)
+
+signif_molecule_RNA <- 
+RNA_intersection_KW %>% filter(intersection == "Yes") %>% filter(!str_detect(comparison, "FT01|FT02|FT19")) %>%
+  select(-zs_fold, -intersection, -groups) %>% 
+  distinct(comparison, molecule_name, .keep_all = T) %>%
+  group_by(molecule_name) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  filter(n == 4) %>% 
+  left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("molecule_name" = "ensembl_gene_id")) %>% 
+  mutate(molecule_name = if_else(!is.na(hgnc_symbol), hgnc_symbol, molecule_name)) %>% 
+  select(-hgnc_symbol) %>% 
+   pull(molecule_name)  
+
+
+```
+
+```{r}
+plot_data <-
+bind_rows(
+  bind_rows(
+    prot_ZS_corr %>% filter(molecule %in% signif_molecule_prot),
+    prot_MM_corr %>% filter(molecule %in% signif_molecule_prot)) %>%  
+    gather(sample_anon, value,-dataset, -correction, -molecule) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT07) Epilepsy Prediction (VGB)`) %>% 
+        distinct()
+    ) %>% 
+    filter(!is.na(`(FT07) Epilepsy Prediction (VGB)`)) %>% 
+    mutate(value = as.numeric(value)),
+bind_rows(
+  bind_rows(
+    metabolites_ZS_corr %>% select(dataset, correction, sample_anon, `glucose-6-phosphate`),
+    metabolites_MM_corr %>% select(dataset, correction, sample_anon, `glucose-6-phosphate`)
+    ) %>% 
+    gather(molecule, value,-dataset, -correction, -sample_anon) %>% 
+  mutate(sample_anon = as.character(sample_anon)) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT07) Epilepsy Prediction (VGB)`) %>% 
+        distinct()
+    ) %>% 
+     filter(!is.na(`(FT07) Epilepsy Prediction (VGB)`)) %>% 
+    mutate(value = as.numeric(value))
+     ),
+bind_rows(
+    RNA_ZS_corr %>% filter(molecule %in% signif_molecule_RNA),
+    RNA_MM_corr %>% filter(molecule %in% signif_molecule_RNA)
+    ) %>% 
+    gather(sample_anon, value,-dataset, -correction, -molecule) %>% 
+    left_join(
+      data$annotations %>%  
+        select(sample_anon, `(FT07) Epilepsy Prediction (VGB)`) %>% 
+        distinct()
+    ) %>% 
+    filter(!is.na(`(FT07) Epilepsy Prediction (VGB)`)) %>% 
+    mutate(value = as.numeric(value))
+) %>% 
+  filter(!is.na(value), !is.na(`(FT07) Epilepsy Prediction (VGB)`))
+
+fig_data$Fig_4 <- plot_data
+
+p_rna <-
+plot_data %>% 
+   filter(dataset == "RNASeq") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT07) Epilepsy Prediction (VGB)", ylab = "log2 counts")
+  })
+
+p_met <-
+plot_data %>% 
+   filter(dataset == "Metabolites") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT07) Epilepsy Prediction (VGB)")
+  })
+
+p_prot <-
+plot_data %>% 
+   filter(dataset == "Proteins") %>% 
+   split(., .$molecule) %>%
+  lapply(function(x) {
+   raincloud_plot_comp(x, "(FT07) Epilepsy Prediction (VGB)")
+  })
+
+```
+
+
+```{r}
+ggarrange(plotlist=c(p_prot, p_met, p_rna), labels = c("a", "b", "c"), common.legend = T)
+ggsave(here::here("univariate_analysis/figures/figure_4.pdf"), width=276, height=210, units='mm', dpi=1200)
+ggsave(here::here("univariate_analysis/figures/figure_4.png"), width=276, height=210, units='mm', dpi=1200)
+```
+
+```{r}
+openxlsx::write.xlsx(fig_data, here::here("univariate_analysis/tables/Fig_data.xlsx"))
+```
+
+
+# Classifier analysis
+
+## Fig 5
+
+```{r}
+library(tidyverse)
+
+load(here::here("models/seizures_normalized_c3.RData"))
+
+models_to_eval <- read_csv(here::here("models/models_pval.csv"))  %>% arrange(desc(mcc.test.mean))
+
+lapply(1:as.numeric(count(models_to_eval)), function(i) {
+ 
+  vars <-
+    models_to_eval[[i, "features"]] %>%
+    str_split(pattern = "\\s\\+\\s") %>%
+    unlist()
+  
+  fields <-
+    vars %>%
+    match(names(raw_values))
+  
+  data <-
+    raw_values[, c(fields, ncol(raw_values)-2, ncol(raw_values)-1, ncol(raw_values))] %>%
+    filter(complete.cases(.)) %>% 
+    mutate(no_seizures = if_else(seizures_any == TRUE, 0, 1)) %>%
+    select(-seizures_any)
+  
+  png(file = "test.png", height=350, width=350, units = "mm", res  = 1200)
+  
+  plot3D::scatter3D(data[[1]], data[[2]], data[[3]],
+            bty = "b2", pch = 19, theta = -40, phi = 20,
+            colvar = as.integer(data$no_seizures), 
+            xlab = "MiR-130a-3p",
+            ylab ="CECR7", zlab = "RADX",
+            col = c( "#BC3C29FF","#0072B5FF"),
+            ticktype = "detailed",
+            colkey = FALSE,
+            # Adjust label sizing
+            cex = 4, # Multiply dot size by 2
+            cex.axis = 2,
+            cex.main = 2, # Multiply the size of main title text by 2
+            cex.lab = 2) # Multiply size of axis label text by 2
+  
+  dev.off()
+  
+})  
+
+options(repr.plot.width = 0.75, repr.plot.height = 0.75) 
+
+  raw_values %>% 
+  select(`rs1046276..T.C._chr16.30914626`, carnitine , seizures_any, code, sample_code) %>% 
+  mutate(seizures = if_else(seizures_any == TRUE, "seizures", "no seizures") %>% as.factor() %>% fct_relevel("seizures")) %>% 
+ggplot(aes(y = `rs1046276..T.C._chr16.30914626`, x = carnitine , color = seizures)) +
+  labs(y = "rs1046276:T>C") +
+  ggsci::scale_color_nejm() +
+  geom_jitter(height = 0.15, width = 0.15, size = 4) +
+    theme_classic() +
+    theme(legend.position = "left", legend.title = element_blank(), text=element_text(size=15,  family="Helvetica", colour = "black"), axis.text = element_text(size = 14, colour = "black"), plot.title = element_text(size=14, colour = "black"), strip.text.x = element_text(size = 14)) 
+
+ggsave("plot2.png",height=140, width=160, units = "mm", dpi  = 1200)
+
+p1 <-png::readPNG('test.png')
+p2 <-png::readPNG('plot2.png')
+
+tmp <- ggpubr::ggarrange(grid::rasterGrob(p1),grid::rasterGrob(p2),labels = c("a", "b"))
+
+ggsave("figure_5.png", plot=tmp, width=276, height=138, units='mm', dpi=1200)
+
+# save data
+fig_data$Fig_5_b <-
+raw_values %>% 
+  mutate(seizures = if_else(seizures_any == TRUE, "seizures", "no seizures") %>% as.factor() %>% fct_relevel("seizures")) %>% 
+  select("rs1046276:T>C" =`rs1046276..T.C._chr16.30914626`, carnitine , seizures) 
+
+vars <-
+  models_to_eval[[1, "features"]] %>%
+  str_split(pattern = "\\s\\+\\s") %>%
+  unlist()
+
+fields <-
+  vars %>%
+  match(names(raw_values))
+
+fig_data$Fig_5_a <-
+  raw_values[, c(fields, ncol(raw_values))] %>%
+  filter(complete.cases(.)) %>% 
+  rename("MiR-130a-3p" =1,
+         "CECR7"=2, "RADX" =3)
+```
+
+## Table 2, 3, S9, S10
+
+```{r}
+tables_classifiers <- list()
+molecule_metrics <- read_csv(here::here("models/molecule_metrics.csv"))
+models_pval <- read_csv(here::here("models/models_pval.csv")) %>% filter(pval < 0.05) %>% select(-`X1`) %>% arrange(desc(mcc.test.mean))
+load("~/EPISTOP/models/seizures_normalized_c3.RData")
+convertGeneIDs <- 
+  read_csv(here::here("univariate_analysis/data/convertGeneIDs.csv")) %>% 
+  distinct(ensembl_gene_id,hgnc_symbol, keep_all = T)
+
+models_to_eval <-
+models_pval %>% 
+  filter(pval < 0.05) %>% 
+  arrange(desc(mcc.test.mean)) %>% 
+  select(features) %>% 
+  separate(features, into = c("feature1", "feature2", "feature3"), sep = "\\+", remove = F) %>% 
+  gather(feature_no, feature_name, c(feature1, feature2, feature3)) %>% 
+  mutate(feature_name = str_trim(feature_name, "both")) %>% 
+  filter(!is.na(feature_name))
+
+models_to_eval <-
+models_to_eval %>% 
+ left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("feature_name" = "ensembl_gene_id")) %>% 
+  # mutate(correct_name = if_else(!is.na(hgnc_symbol), paste0(hgnc_symbol, " (", feature_name, ")"), feature_name)) %>% 
+  mutate(correct_name = if_else(!is.na(hgnc_symbol), hgnc_symbol, feature_name)) %>% 
+  mutate(correct_name = case_when(
+    str_detect(correct_name, "^TSC.TSC") ~ str_replace(correct_name, "^TSC.TSC", "TSC"),
+    str_detect(correct_name, "^rs") ~ str_replace_all(correct_name, "\\.|_", " "),
+    str_detect(correct_name, "\\.") ~ str_replace_all(correct_name, "\\.", "-"),
+    TRUE ~ correct_name
+  )) %>% 
+  mutate(correct_name = case_when(
+    str_detect(correct_name, "^rs") ~ str_replace(correct_name, "(?<=[A|T|C|G])\\s", "\\/"),
+    TRUE ~ correct_name
+  )) %>% 
+  select(-hgnc_symbol)
+
+models_pval <-
+models_pval %>% 
+  left_join(
+    models_to_eval %>% 
+      group_by(features) %>% 
+         transmute(features, correct_names = paste0(correct_name, collapse = " + ")) %>% 
+      distinct()
+  ) %>% 
+  select(features_n = correct_names, everything(), -group, -id, -no_of_samples, - features)
+```
+
+
+```{r}
+molecules_to_count <- unique(models_to_eval$feature_name)
+
+molecules_to_count <-
+raw_values[,c("seizures_any", molecules_to_count)] %>% 
+  mutate_at(vars(starts_with("rs")), as.factor) %>% 
+  mutate_at(vars(starts_with("TSC")), as.factor)
+
+molecules_stats <-
+  molecules_to_count %>% 
+  group_by(seizures_any) %>%
+   summarise(n = n()) %>%
+  left_join(
+    molecules_to_count %>% 
+      group_by(seizures_any) %>% 
+       summarise(across(where(is.factor), 
+                        list(homozygote = ~ sum(.x == 1, na.rm = TRUE), 
+                             heterozygote = ~ sum(.x == 0, na.rm = TRUE), 
+                             n = ~sum(!is.na(.x))))) %>% 
+      gather(key, value, - seizures_any) %>% 
+      separate(key, c("key", "what"), sep = "_(?=h|n)") %>% 
+      spread(what, value) %>% 
+      mutate(ht_pcent =  
+               scales::percent(heterozygote/n, accuracy =1), 
+             hm_pcent =  scales::percent(homozygote/n, accuracy =1) 
+             ) %>% 
+      mutate(numbers = paste0("hm:", hm_pcent, " / ", "ht:", ht_pcent, "; n=", n)) %>% 
+      select(-homozygote, -heterozygote, -ht_pcent, -hm_pcent, -n) %>% 
+      spread(key, numbers)
+  ) %>% 
+  left_join(
+   molecules_to_count %>% 
+      group_by(seizures_any) %>% 
+        summarise(across(where(is.numeric), 
+                        list(median = ~ median(.x, na.rm = TRUE), 
+                             Q1 = ~ quantile(.x, 0.25, na.rm = TRUE), 
+                             Q3 = ~ quantile(.x, 0.75, na.rm = TRUE),
+                             n = ~sum(!is.na(.x))))) %>% 
+       mutate_if(is.numeric, round, 2) %>% 
+       gather(key, value, - seizures_any) %>% 
+      separate(key, c("key", "what"), sep = "_(?=Q|m|n)") %>% 
+      spread(what, value) %>% 
+      mutate(numbers = paste0(median, " (", Q1, "-", Q3, ")", "; n=", n)) %>% 
+      select(-median, -Q1, -Q3, -n) %>% 
+      spread(key, numbers)
+      ) %>% 
+  gather(variable, value, - seizures_any) %>% 
+  spread(seizures_any, value) %>% 
+   left_join(
+     molecules_to_count %>% 
+      group_by(seizures_any) %>% 
+        summarise(across(where(is.numeric), 
+                        list(median = ~ median(.x, na.rm = TRUE)))) %>% 
+       mutate_if(is.numeric, round, 2) %>% 
+       gather(key, value, - seizures_any) %>% 
+      separate(key, c("key", "what"), sep = "_(?=Q|m)") %>% 
+      spread(what, value) %>% 
+       spread(seizures_any, median) %>% 
+       mutate(`up (+) or down(-) in seizures group` = if_else(`TRUE` > `FALSE`, "+", "-")) %>% 
+       select(-`TRUE`, -`FALSE`) %>% 
+       rename(variable = key)
+  ) %>% 
+  transmute(variable, `up (+) or down(-) in seizures group`, `Seizures [median (IQR)]`= `TRUE`, `No seizures [median (IQR)]` = `FALSE`)
+
+to_save <-  
+molecules_stats %>% 
+left_join(molecule_metrics, by = c("variable" = "feature_name")) %>% 
+  select(variable, n_models, everything()) %>% 
+  filter(variable != "n") %>% 
+  arrange(desc(n_models)) %>%
+  rename(feature_name = variable) %>% 
+  left_join(models_to_eval %>% transmute(feature_name, variable = correct_name) %>% distinct()) %>% 
+  select(variable, everything(), -feature_name, -hgnc_symbol )
+```
+
+
+```{r}
+tables_classifiers$`Table 3` <- models_pval[1:10,]
+tables_classifiers$`Table 4` <- to_save[1:12,]
+tables_classifiers$`Table S8` <- models_pval
+tables_classifiers$`Table S9` <- to_save
+openxlsx::write.xlsx(tables_classifiers, here::here("univariate_analysis/tables/Table_3_4_S8_S9.xlsx"))
+```
+
+```{r}
+bar_plot <- function(dataset, variable, condition = treatment, scale_name = variable) {
+  variable <- enquo(variable)
+  condition <- enquo(condition)
+  
+    dataset %>%
+      group_by(!! condition) %>%
+      count(!! variable) %>%
+      add_column(agreement = "all", .before = 1) %>% 
+    mutate_if(is.numeric, funs(pcent = (. / sum(.)))) %>%
+    rename(value = n) %>%
+    ggplot(aes_(x = condition, y = ~pcent, label = ~value, fill = variable)) +
+    geom_bar(stat = "identity") +
+    geom_text(position = position_stack(vjust = 0.5)) +
+    facet_wrap(~agreement) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "top") +
+    xlab(NULL) +
+    ylab("proportion") +
+    scale_fill_discrete(scale_name) +
+    scale_y_continuous(labels = scales::percent)
+}
+
+molecules_to_count %>% 
+  select(variable = `rs1046276..T.C._chr16.30914626`, seizures_any) %>% 
+  filter(!is.na(variable)) %>% 
+  bar_plot(variable, seizures_any)
+
+raincloud_plot <- function(x, title){
+  
+   ggplot(aes(x = seizures_any, y = value, fill = seizures_any), data = x)+
+        ggdist::stat_halfeye(
+      adjust = 0.5,
+      justification = -.2,
+      .width = 0,
+      point_colour = NA,
+      scale = 0.65
+    ) +
+         geom_point(aes(color = seizures_any), position = position_jitter(width = .15, height = 0), size = .25) +
+      geom_boxplot(
+        aes(fill = NULL),
+        width = 0.2,
+        outlier.colour = NA,
+        alpha = 0.5
+      ) +
+     scale_color_manual(values = pal_nejm("default")(5)[2:3]) +
+    scale_fill_manual(values = pal_nejm("default")(5)[2:3]) +
+      labs(x = NULL, title = title) +
+      theme_classic() +
+      theme(legend.position = "none",
+                axis.text.x= element_blank(),#element_text(angle=60, hjust=1), 
+                text=element_text(size=12,  family="Helvetica", colour = "black"), axis.text = element_text(size = 12, colour = "black"), plot.title = element_text(size=12, colour = "black"), strip.text.x = element_text(size = 10), strip.text.y = element_blank(), panel.grid.minor = element_blank(), strip.background.x = element_rect(fill = "white"))
+}
+
+molecules_to_count %>% 
+  gather(variable, value, -seizures_any) %>% 
+  split(., .$variable) %>% 
+  lapply(function(x){
+    name <- x$variable[1]
+    name <- str_remove_all(name, "\\.")
+    x$value <- as.numeric(x$value)
+    raincloud_plot(x, title = name)
+    ggsave(paste0(here::here("univariate_analysis/figures/models/"), name, ".png"), dpi=300)
+  })
+ 
+```

@@ -1,5 +1,6 @@
 *.xlsx
 *.csv
+*.pdf
 *.png
 *.html
 .Rproj.user

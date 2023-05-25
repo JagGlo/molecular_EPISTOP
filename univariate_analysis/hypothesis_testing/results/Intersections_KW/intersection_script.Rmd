@@ -1,0 +1,254 @@
+---
+title: "Kruskal-Wallis & pairwise test intersection"
+output: 
+  html_notebook:
+    df_print: paged
+    code_folding: hide
+    toc: TRUE
+    number_sections: TRUE
+---
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(VennDiagram)
+setwd("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/")
+```
+```{r}
+print_venn <- function(KW_vector_names, Wilcox_vector_names, comparison_name) {
+  
+  x <- list(KW = KW_vector_names, 
+            Wilcox = Wilcox_vector_names)
+  
+  # Generate plot
+  venn.diagram(x,
+                    fill = c("orange", "blue"),
+                    alpha = c(0.5, 0.5), 
+               # cat.cex = 1.5, cex=1.5,
+                    filename=NULL,
+                    main = comparison_name,
+               output = TRUE)
+  
+  ## have a look at the default plot
+  # grid.newpage()
+  # grid.draw(v)
+  
+  # have a look at the names in the plot object v
+  # lapply(v,  names)
+  # We are interested in the labels
+  # lapply(v, function(i) i$label)
+  
+  # Over-write labels (5 to 7 chosen by manual check of labels)
+  # in KW_vector_names only
+  # v[[5]]$label  <- paste(setdiff(KW_vector_names, Wilcox_vector_names), collapse="\n")  
+  # # in Wilcox_vector_names only
+  # v[[6]]$label <- paste(setdiff(Wilcox_vector_names, KW_vector_names)  , collapse="\n")  
+  # # intesection
+  # v[[7]]$label <- paste(intersect(KW_vector_names, Wilcox_vector_names), collapse="\n")  
+  # 
+  # # plot  
+  # grid.newpage()
+  # grid.draw(v)
+}
+```
+
+# Proteomics
+
+```{r}
+KW_intersection <- 
+  read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/modification_12_11_21_KW/Proteomics/intersection_both_methods_KW.csv") %>% 
+  filter(intersection == "Yes") 
+
+Wilcox_intersection <- 
+  read_excel("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/Current Results (April 2021)/Mixed Models versus Z-Score/intersection/proteomics_intersection.xlsx") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT05|FT06|FT07|FT08|FT09|FT10"))
+
+molecule_list <-
+bind_rows(
+  KW_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name,
+      id = "KW"
+    ),
+  Wilcox_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name = feature,
+      id = "Wilcox"
+    ) 
+) %>% 
+  separate(molecule_name, "molecule_name", sep = ";")
+
+
+```
+
+```{r}
+KW_intersection <- 
+  read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/modification_12_11_21_KW/Proteomics/intersection_both_methods_KW.csv") %>% 
+  filter(intersection == "Yes") %>% 
+  distinct(molecule_name)
+
+Wilcox_intersection <- 
+  read_excel("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/Current Results (April 2021)/Mixed Models versus Z-Score/intersection/proteomics_intersection.xlsx") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT01|FT02")) %>% 
+  distinct(feature)
+
+
+bind_rows(
+  Wilcox_intersection%>% 
+    rename(molecule_name = feature) %>% 
+    add_column(comparison = "FT01-FT02")
+  ,
+  KW_intersection %>% 
+    add_column(comparison = "FT07-FT10")
+) %>% 
+  select(comparison, molecule_name) %>% 
+  write_csv("protein_unique.csv")
+```
+
+
+
+```{r}
+molecule_list %>%
+  split(., .$comparison) %>%
+  lapply(function(x) {
+     
+   v <- print_venn(x$molecule_name[x$id == "KW"],
+               x$molecule_name[x$id == "Wilcox"],
+               comparison_name = x$comparison[1])
+  
+   grid.newpage()
+   print(grid.draw(v, recording = F))
+   table <- x %>% select(-comparison) %>%  table()
+    return(table)
+  }
+  )
+```
+
+# Metabolomics
+
+```{r message=FALSE, warning=FALSE}
+KW_intersection <- 
+  read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/modification_12_11_21_KW/Metabolomics/intersection_both_methods_KW.csv") %>% 
+  filter(intersection == "Yes")
+
+Wilcox_intersection <- 
+  read_excel("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/Current Results (April 2021)/Mixed Models versus Z-Score/intersection/metabolomics_intersection.xlsx") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT05|FT06|FT07|FT08|FT09|FT10"))
+
+molecule_list <-
+bind_rows(
+  KW_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name,
+      id = "KW"
+    ),
+  Wilcox_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name = feature,
+      id = "Wilcox"
+    ) 
+) %>% 
+  separate(molecule_name, "molecule_name", sep = ";")
+
+molecule_list %>%
+  split(., .$comparison) %>%
+  lapply(function(x) {
+     
+   v <- print_venn(x$molecule_name[x$id == "KW"],
+               x$molecule_name[x$id == "Wilcox"],
+               comparison_name = x$comparison[1])
+  
+   grid.newpage()
+   print(grid.draw(v, recording = F))
+   table <- x %>% select(-comparison) %>%  table()
+    return(table)
+  }
+  )
+```
+
+# RNA-Seq
+
+```{r message=FALSE, warning=FALSE}
+convertGeneIDs <- read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/convertGeneIDs.csv")
+
+KW_intersection <- 
+  read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/modification_12_11_21_KW/RNASeq/intersection_both_methods_KW.csv") %>% 
+  filter(intersection == "Yes") %>% 
+    left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("molecule_name" = "ensembl_gene_id")) %>% 
+        mutate(gene = if_else(!is.na(hgnc_symbol), hgnc_symbol, molecule_name)) %>% 
+  distinct(comparison, groups, gene, .keep_all = T)
+
+
+Wilcox_intersection <- 
+  read_excel("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/Current Results (April 2021)/Mixed Models versus Z-Score/intersection/RNASeq_intersection.xlsx") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT05|FT06|FT07|FT08|FT09|FT10")) %>% 
+  distinct(comparison, gene, .keep_all = T)
+
+molecule_list <-
+bind_rows(
+  KW_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name = gene,
+      id = "KW"
+    ),
+  Wilcox_intersection %>% 
+    transmute(
+      comparison = str_extract(comparison, "^\\(FT\\d{1,2}\\)"),
+      molecule_name = gene,
+      id = "Wilcox"
+    ) 
+) %>% 
+  separate(molecule_name, "molecule_name", sep = ";")
+
+molecule_list %>%
+  split(., .$comparison) %>%
+  lapply(function(x) {
+     
+   v <- print_venn(x$molecule_name[x$id == "KW"],
+               x$molecule_name[x$id == "Wilcox"],
+               comparison_name = x$comparison[1])
+  
+   grid.newpage()
+   print(grid.draw(v, recording = F))
+   table <- x %>% select(-comparison) %>%  table()
+    return(table)
+  }
+  )
+```
+
+```{r}
+KW_intersection <- 
+   read_csv("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/modification_12_11_21_KW/RNASeq/intersection_both_methods_KW.csv") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT07|FT08|FT09|FT10")) %>% 
+    left_join(convertGeneIDs %>% select(ensembl_gene_id, hgnc_symbol), by = c("molecule_name" = "ensembl_gene_id")) %>% 
+        mutate(gene = if_else(!is.na(hgnc_symbol), hgnc_symbol, molecule_name)) %>% 
+  distinct(gene)
+
+Wilcox_intersection <- 
+   read_excel("C:/Users/glowackaj/OneDrive/Artykuł EPISTOP/article EPISTOP/results/Current Results (April 2021)/Mixed Models versus Z-Score/intersection/RNASeq_intersection.xlsx") %>% 
+  filter(intersection == "Yes") %>% 
+  filter(str_detect(comparison,"FT01|FT02")) %>% 
+  distinct(gene)
+
+bind_rows(
+  Wilcox_intersection%>% 
+    add_column(comparison = "FT01-FT02")
+  ,
+  KW_intersection %>% 
+    add_column(comparison = "FT07-FT10")
+) %>% 
+  select(comparison, gene) %>% 
+  write_csv("RNA_unique.csv")
+
+```
+
