@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Welcome to the "Molecular EPISTOP" repository. In adherence to the principles of open science, we aim to maintain transparency and ensure the reproducibility of our research.
+Welcome to the "Molecular EPISTOP" repository. In adherence to the principles of open science, we aim to maintain transparency and ensure the reproducibility of our research by sharing the code with fellow researchers.
 
 ## Paper Reference
 
