@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Welcome to the "Molecular EPISTOP" repository. In adherence to the principles of open science, we aim to maintain transparency and ensure the reproducibility of our research. This repository contains code and data collected during the "EPISTOP" project. The purpose of sharing this repository is to facilitate the advancement of scientific knowledge and enable fellow researchers to build upon the established findings.
+Welcome to the "Molecular EPISTOP" repository. In adherence to the principles of open science, we aim to maintain transparency and ensure the reproducibility of our research.
 
 ## Paper Reference
 
