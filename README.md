@@ -21,8 +21,8 @@ This repository is organized into different directories, each serving a distinct
 
 For any inquiries or additional information related to the "Molecular EPISTOP" repository, please contact:
 
-- **Name:** [Jagoda Glowacka-Walas]
-- **Email:** [glowacka.jagoda@op.pl]
+- **Name:** Jagoda Glowacka-Walas
+- **Email:** glowacka.jagoda@op.pl
 
 ---
 
