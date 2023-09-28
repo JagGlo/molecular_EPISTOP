@@ -1,5 +1,3 @@
-source("~/interim_report/reports/data_preprocessing.R") # preprocessed data & additional files
-
 n <- 100
 results <- list()
 
@@ -25,7 +23,7 @@ for (i in 1:n) {
   
     source(here::here("models/3_read_chunks.R"))
 
-    write_csv(model_stats, paste0("~/interim_report/models/iteration_", i, ".csv"))
+    write_csv(model_stats, paste0("/models/iteration_", i, ".csv"))
   }
   },
   error = function(e) {

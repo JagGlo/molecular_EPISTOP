@@ -1,0 +1,206 @@
+---
+title: "Permutation experiment results"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+               warning = FALSE, 
+               message = FALSE,
+               fig.pos = 'H')
+
+library(tidyverse)
+library(kableExtra)
+
+all_csvs <- list.files("/models/", full.names = TRUE, pattern = ".csv")
+```
+
+# Permutation results:
+
+```{r}
+all_results <- list.files("models/results/", full.names = TRUE, pattern = ".csv")
+
+
+pbapply::pblapply(all_results, read_csv) %>% 
+  bind_rows(.id = "id") %>% 
+  arrange(desc(x)) %>% 
+  select(-X1) %>% 
+  rename(no_of_models = x)
+```
+We did not process iterations with > 1,500,000 models.
+
+```{r}
+model_stats <-
+  pbapply::pblapply(all_csvs, read_csv) %>% 
+  bind_rows(.id = "id") 
+
+model_stats %>%
+  ggplot(aes(x = mcc.test.mean)) +
+  geom_density(aes()) 
+```
+
+Number of zeros:
+
+```{r}
+model_stats %>%  
+  filter(mcc.test.mean == 0) %>% 
+  count(id) %>% 
+  arrange (desc(nn)) %>% 
+  left_join(model_stats %>% group_by(id) %>% count(id) %>% arrange (desc(nn)), by = "id") %>% 
+  rename(no_of_zeros = nn.x, no_of_models = nn.y) %>% 
+  mutate(pcent = round(no_of_zeros/no_of_models * 100, 3))
+```
+
+# Models:
+
+```{r}
+data_full <- read_csv("models/data_full.csv")
+data_full %>% filter(n >48 & n <= 65)
+all_classifiers <-
+bind_rows(
+  list(classifier = data_full, permutations = model_stats), 
+ .id = "group") %>% 
+  mutate(no_of_samples = cut(n, c(0, 48, 65, 80)))
+```
+
+```{r}
+all_classifiers %>% 
+  filter(no_of_samples == "(48,65]") %>% 
+  ggplot(aes(x = mcc.test.mean, colour = group)) +
+  geom_density(aes()) +
+  xlab("Matthews Correlation Coefficient") +
+  theme_minimal()
+```
+
+```{r}
+all_classifiers %>% 
+  ggplot(aes(x = mcc.test.mean, colour = group)) +
+  geom_density(aes()) +
+  xlab("Matthews Correlation Coefficient") +
+  facet_grid(. ~ no_of_samples)
+```
+
+```{r}
+all_classifiers %>% 
+  filter(no_of_samples == "(48,65]") %>% 
+  group_by(group) %>% 
+  count()
+
+all_classifiers %>% 
+  filter(no_of_samples == "(48,65]" & group == "classifier") %>% 
+  filter(mcc.test.mean > 0.7 & mcc.test.mean <= 0.8) %>% 
+  count()
+```
+
+```{r}
+all_classifiers %>% sample_n(10)
+
+perm_models <- all_classifiers %>% filter(no_of_samples == "(48,65]" & group == "permutations") 
+
+models_to_eval <- all_classifiers %>% filter(no_of_samples == "(48,65]" & group == "classifier" & mcc.test.mean > 0.7) 
+
+n_perm <- perm_models %>% count() %>% pull()
+
+results <-
+models_to_eval %>% 
+  split(., .$features) %>% 
+  lapply(function(x) {
+    x$pval <- sum(perm_models$mcc.test.mean >= x$mcc.test.mean) / n_perm
+    return(x)
+  }) %>% 
+  bind_rows()
+
+results <-
+  results %>% 
+  filter(pval < 0.05)
+
+results %>% mutate_if(is.numeric, round, 3) %>% 
+ write.csv("models_pval.csv", na = "")
+```
+
+```{r}
+gene_names <-
+  read_csv("convertGeneIDs.csv")
+
+results <- read_csv("models_pval.csv") %>% filter(pval < 0.05)
+
+results %>% 
+  separate(features, into = c("feature1", "feature2", "feature3"), sep = "\\+", remove = F) %>% 
+  gather(feature_no, feature_name, c(feature1, feature2, feature3)) %>% 
+  mutate(feature_name = str_trim(feature_name, "both")) %>% 
+  filter(!is.na(feature_name)) %>% 
+  group_by(feature_name) %>% 
+  summarise(
+    n_models = n(),
+    mean_mcc = round(mean(mcc.test.mean, na.rm = T),3),
+    mean_thr = round(mean(thr, na.rm = T),3),
+    mean_mmce = round(mean(mmce.test.mean, na.rm = T),3),
+    mean_npv = round(mean(npv.test.mean, na.rm = T),3),
+    mean_ppv = round(mean(ppv.test.mean, na.rm = T),3),
+  ) %>% 
+  arrange(desc(n_models)) %>% # write.csv("molecule_metrics.csv", na = "")
+  left_join(gene_names %>% select(ensembl_gene_id, hgnc_symbol), by = c("feature_name" = "ensembl_gene_id")) %>% write.csv("molecule_metrics.csv")
+  select(feature_name, hgnc_symbol)
+```
+
+
+
+```{r}
+all_classifiers %>% 
+  filter((no_of_samples == "(0,48]" & mcc.test.mean >= 0.8320417) | 
+           (no_of_samples == "(48,65]" & mcc.test.mean >= 0.7283089) |
+           (no_of_samples == "(65,80]" & mcc.test.mean >= 0.5790182)) %>% 
+  ggplot(aes(x = mcc.test.mean, colour = group)) +
+  geom_density() +
+  xlab("Matthews Correlation Coefficient") +
+  facet_grid(. ~ no_of_samples, scales = "free_x") +
+  labs(title = "The x scales start with 95th quantile of permuted models", subtitle = "MCC = 0.83 for (0,48]; MCC = 0.73 for (48,65] and MCC = 0.58 for (65,80]")
+```
+
+```{r}
+library(hexbin)
+all_classifiers %>% 
+  ggplot(aes(x = mcc.test.mean, y = n)) +
+  geom_hex() +
+  scale_fill_viridis_c(trans = "log10") +
+  facet_grid(. ~ group)
+```
+  
+```{r}
+quantile(model_stats$mcc.test.mean, c(0.9, 0.95), na.rm = T)
+```
+
+```{r}
+all_classifiers %>% 
+  split(.,  f = list(.$group, .$no_of_samples)) %>% 
+  lapply(function(x) {quantile(x$mcc.test.mean, c(0.9, 0.95), na.rm = T) })
+```
+
+```{r}
+`90th_q` <- quantile(model_stats$mcc.test.mean[model_stats$n >= 50], 0.9, na.rm = T) %>% as.numeric()
+`95th_q` <- quantile(model_stats$mcc.test.mean[model_stats$n >= 50], 0.95, na.rm = T) %>% as.numeric()
+```
+
+## 90th quantile:
+```{r}
+data_full %>% 
+  filter(n >= 50 & n <= 65) %>% 
+  filter(mcc.test.mean >= `90th_q`) %>% 
+  filter(!is.na(npv.test.mean))
+```
+
+## 95th quantile:
+```{r}
+data_full %>% 
+  filter(n >= 50 & n <= 65) %>% 
+  filter(mcc.test.mean >= `95th_q`) %>% 
+  filter(!is.na(npv.test.mean))
+```
+
+
+
+
